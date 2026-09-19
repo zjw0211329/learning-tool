@@ -714,34 +714,35 @@ def _opt(fn):
     return check
 
 
-# 备份校验声明表（表驱动，Qoder 审查建议）：{表名: [(字段, 校验器), ...]}
+# 备份校验声明表（表驱动，Qoder 审查建议）：{表名: [(字段, 校验器, 中文标签), ...]}
 # 每条记录还必须是 dict；跨表外键引用在 _valid_backup 里单独校验。
 # 新增可导入字段时在这里加一行即可，不要回到手写 if 的老路（三轮审查漏网的教训）。
+# 中文标签用于报错文案（NFR5：toast 是用户唯一能看到的诊断信息）。
 _BACKUP_SPEC = {
     "directions": [
-        ("id", _is_int),
-        ("name", _is_nonempty_str),
-        ("description", _opt(_is_optional_text)),
+        ("id", _is_int, "ID"),
+        ("name", _is_nonempty_str, "名称"),
+        ("description", _opt(_is_optional_text), "描述"),
     ],
     "phases": [
-        ("id", _is_int),
-        ("name", _is_nonempty_str),
-        ("goal", _opt(_is_optional_text)),
-        ("sort_order", _opt(_is_sort_order)),
+        ("id", _is_int, "ID"),
+        ("name", _is_nonempty_str, "名称"),
+        ("goal", _opt(_is_optional_text), "目标"),
+        ("sort_order", _opt(_is_sort_order), "排序序号"),
     ],
     "tasks": [
-        ("id", _is_int),
-        ("title", _is_nonempty_str),
-        ("note", _opt(_is_optional_text)),
-        ("status", _is_status),
-        ("sort_order", _opt(_is_sort_order)),
-        ("done_at", _opt(_is_date_or_none)),
+        ("id", _is_int, "ID"),
+        ("title", _is_nonempty_str, "标题"),
+        ("note", _opt(_is_optional_text), "备注"),
+        ("status", _is_status, "状态"),
+        ("sort_order", _opt(_is_sort_order), "排序序号"),
+        ("done_at", _opt(_is_date_or_none), "完成时间"),
     ],
     "logs": [
-        ("id", _is_int),
-        ("date", _is_iso_date),
-        ("minutes", _opt(_is_minutes)),
-        ("content", _opt(_is_optional_text)),
+        ("id", _is_int, "ID"),
+        ("date", _is_iso_date, "日期"),
+        ("minutes", _opt(_is_minutes), "时长"),
+        ("content", _opt(_is_optional_text), "内容"),
     ],
 }
 
@@ -750,6 +751,7 @@ def _valid_backup(body):
     """校验备份（表驱动）：元信息 → 逐表逐字段跑声明表 → 跨表外键。返回错误信息或 None。
 
     原则（FR7.2）：任何畸形输入都走 400，不能漏到 INSERT 阶段抛 KeyError/TypeError 变 500。
+    报错文案用声明表里的中文标签（NFR5），用户不需要认识数据库字段名。
     """
     if body.get("app") != BACKUP_APP_ID or body.get("version") != BACKUP_VERSION:
         return "不是有效的 study tools 备份文件"
@@ -761,12 +763,12 @@ def _valid_backup(body):
         for row in body[table]:
             if not isinstance(row, dict):
                 return f"{table} 中存在非对象记录"
-            for field, validator in fields:
+            for field, validator, label in fields:
                 value = row.get(field, _ABSENT)
                 if validator(value):
                     continue
                 shown = "<缺失>" if value is _ABSENT else repr(value)
-                return f"{table} 中存在非法 {field}: {shown}"
+                return f"{table} 中存在非法{label}: {shown}"
 
     # 外键引用（跨表，进不了单表声明表）
     dir_ids = {d["id"] for d in body["directions"]}
