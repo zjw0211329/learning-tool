@@ -677,45 +677,98 @@ def _is_iso_date(text):
         return False
 
 
+def _is_nonempty_str(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _is_optional_text(value):
+    """可选文本字段：None 或字符串放行，其它类型（数字/对象）拒绝。"""
+    return value is None or isinstance(value, str)
+
+
+def _is_sort_order(value):
+    # None 放行（导入时按 0 处理）；字符串会导致之后 MAX(sort_order)+1 变 str+int → 500
+    return value is None or _is_int(value)
+
+
+def _is_minutes(value):
+    # minutes 不允许 None（与 sort_order 的历史行为刻意不同，保持不变）
+    return _is_int(value) and value >= 0
+
+
+def _is_status(value):
+    return value in TASK_STATUSES
+
+
+def _is_date_or_none(value):
+    return value is None or _is_iso_date(value)
+
+
+_ABSENT = object()
+
+
+def _opt(fn):
+    """把校验器包装成「字段可缺省」：缺省放行，给了值就必须合法。"""
+    def check(value):
+        return True if value is _ABSENT else fn(value)
+    return check
+
+
+# 备份校验声明表（表驱动，Qoder 审查建议）：{表名: [(字段, 校验器), ...]}
+# 每条记录还必须是 dict；跨表外键引用在 _valid_backup 里单独校验。
+# 新增可导入字段时在这里加一行即可，不要回到手写 if 的老路（三轮审查漏网的教训）。
+_BACKUP_SPEC = {
+    "directions": [
+        ("id", _is_int),
+        ("name", _is_nonempty_str),
+        ("description", _opt(_is_optional_text)),
+    ],
+    "phases": [
+        ("id", _is_int),
+        ("name", _is_nonempty_str),
+        ("goal", _opt(_is_optional_text)),
+        ("sort_order", _opt(_is_sort_order)),
+    ],
+    "tasks": [
+        ("id", _is_int),
+        ("title", _is_nonempty_str),
+        ("note", _opt(_is_optional_text)),
+        ("status", _is_status),
+        ("sort_order", _opt(_is_sort_order)),
+        ("done_at", _opt(_is_date_or_none)),
+    ],
+    "logs": [
+        ("id", _is_int),
+        ("date", _is_iso_date),
+        ("minutes", _opt(_is_minutes)),
+        ("content", _opt(_is_optional_text)),
+    ],
+}
+
+
 def _valid_backup(body):
-    """校验备份：元信息、四个数组、必填字段、取值范围、外键引用完整。返回错误信息或 None。
+    """校验备份（表驱动）：元信息 → 逐表逐字段跑声明表 → 跨表外键。返回错误信息或 None。
 
     原则（FR7.2）：任何畸形输入都走 400，不能漏到 INSERT 阶段抛 KeyError/TypeError 变 500。
     """
     if body.get("app") != BACKUP_APP_ID or body.get("version") != BACKUP_VERSION:
         return "不是有效的 study tools 备份文件"
-    for key in ("directions", "phases", "tasks", "logs"):
+    for key in _BACKUP_SPEC:
         if not isinstance(body.get(key), list):
             return f"备份缺少 {key} 数据"
 
-    # 1) 每条记录必须是对象；id/sort_order 必须是整数；名称类字段必须是非空字符串，
-    #    可选文本字段（描述/目标/备注/内容）只要给了值就必须是字符串
-    for rows, table, required_text, optional_text in (
-        (body["directions"], "directions", ("name",), ("description",)),
-        (body["phases"], "phases", ("name",), ("goal",)),
-        (body["tasks"], "tasks", ("title",), ("note",)),
-        (body["logs"], "logs", (), ("content",)),
-    ):
-        for r in rows:
-            if not isinstance(r, dict):
+    for table, fields in _BACKUP_SPEC.items():
+        for row in body[table]:
+            if not isinstance(row, dict):
                 return f"{table} 中存在非对象记录"
-            if not _is_int(r.get("id")):
-                return f"{table} 中存在 id 缺失或非法的记录"
-            # sort_order 是字符串的话，导入本身不会报错，但之后「新建任务/阶段」
-            # 里的 MAX(sort_order)+1 会变成 str+int → 500，且再也加不了
-            order = r.get("sort_order", 0)
-            if order is not None and not _is_int(order):
-                return f"{table} 中存在非法 sort_order: {order!r}"
-            for field in required_text:
-                value = r.get(field)
-                if not isinstance(value, str) or not value.strip():
-                    return f"{table} 中存在 {field} 缺失或为空的记录"
-            for field in optional_text:
-                value = r.get(field, "")
-                if value is not None and not isinstance(value, str):
-                    return f"{table} 中存在非文本的 {field}: {value!r}"
+            for field, validator in fields:
+                value = row.get(field, _ABSENT)
+                if validator(value):
+                    continue
+                shown = "<缺失>" if value is _ABSENT else repr(value)
+                return f"{table} 中存在非法 {field}: {shown}"
 
-    # 2) 外键引用与取值
+    # 外键引用（跨表，进不了单表声明表）
     dir_ids = {d["id"] for d in body["directions"]}
     phase_ids = {p["id"] for p in body["phases"]}
     for p in body["phases"]:
@@ -724,18 +777,9 @@ def _valid_backup(body):
     for t in body["tasks"]:
         if t.get("phase_id") not in phase_ids:
             return "tasks 中存在指向不存在阶段的记录"
-        if t.get("status") not in TASK_STATUSES:
-            return f"tasks 中存在非法状态: {t.get('status')!r}"
-        if t.get("done_at") is not None and not _is_iso_date(t["done_at"]):
-            return f"tasks 中存在非法完成时间: {t.get('done_at')!r}"
     for l in body["logs"]:
         if l.get("direction_id") not in dir_ids:
             return "logs 中存在指向不存在方向的记录"
-        if not _is_iso_date(l.get("date")):
-            return f"logs 中存在非法日期: {l.get('date')!r}"
-        minutes = l.get("minutes", 0)
-        if not _is_int(minutes) or minutes < 0:
-            return f"logs 中存在非法时长: {minutes!r}"
     return None
 
 
