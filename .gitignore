@@ -1,0 +1,12 @@
+# 运行时生成的本地数据（个人学习日志，不上传）
+app/data/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 系统与编辑器杂项
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

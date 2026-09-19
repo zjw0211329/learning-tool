@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>study tools · 个人学习管理</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- 顶部导航 -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand" @click="goHome">📚 study tools</div>
+      <nav class="nav">
+        <button class="nav-btn" :class="{active: view === 'home'}" @click="goHome">总览</button>
+        <button class="nav-btn" :class="{active: view === 'detail'}"
+                :disabled="!currentId" @click="openDetail(currentId)">方向详情</button>
+        <button class="nav-btn" :class="{active: view === 'stats'}"
+                :disabled="!currentId" @click="openStats(currentId)">统计回顾</button>
+      </nav>
+      <div class="crumb" v-if="currentDirection && view !== 'home'">
+        当前方向：<b>{{ currentDirection.name }}</b>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- ============ 视图一：总览 ============ -->
+    <section v-if="view === 'home'">
+      <div class="page-head">
+        <h1>我的学习方向</h1>
+        <p class="muted">以方向为单位记录大学四年的每一步</p>
+      </div>
+
+      <div v-if="!loadingDirections && directions.length === 0" class="empty card">
+        <div class="empty-emoji">🌱</div>
+        <h2>还没有任何学习方向</h2>
+        <p class="muted">创建第一个方向（比如「嵌入式」），或先载入示例数据看看效果。</p>
+        <div class="empty-actions">
+          <button class="btn btn-primary" @click="showNewDir = !showNewDir">＋ 新建方向</button>
+          <button class="btn" :disabled="seeding" @click="loadDemo">
+            {{ seeding ? '载入中…' : '载入示例数据（嵌入式）' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="showNewDir || directions.length > 0" class="card form-card">
+        <div class="form-row">
+          <input v-model.trim="newDir.name" placeholder="方向名称，如：嵌入式" @keyup.enter="createDirection">
+          <input v-model.trim="newDir.description" placeholder="一句话描述（可选）" class="grow"
+                 @keyup.enter="createDirection">
+          <button class="btn btn-primary" @click="createDirection">创建</button>
+        </div>
+      </div>
+
+      <div class="card-grid">
+        <div v-for="d in directions" :key="d.id" class="card dir-card" @click="openDetail(d.id)">
+          <div class="dir-head">
+            <h3>{{ d.name }}</h3>
+            <button class="icon-btn" title="删除方向" @click.stop="deleteDirection(d)">✕</button>
+          </div>
+          <p class="muted small">{{ d.description || '（无描述）' }}</p>
+          <div class="progress-track"><div class="progress-fill" :style="{width: d.progress + '%'}"></div></div>
+          <div class="dir-meta">
+            <span class="pct">{{ d.progress }}%</span>
+            <span>任务 {{ d.done }}/{{ d.total }}</span>
+            <span>累计 {{ fmtMinutes(d.total_minutes) }}</span>
+            <span class="streak" :class="{lit: d.streak > 0}">🔥 连续 {{ d.streak }} 天</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 视图二：方向详情 ============ -->
+    <section v-if="view === 'detail'">
+      <div class="page-head">
+        <h1>{{ detail.direction ? detail.direction.name : '…' }}</h1>
+        <p class="muted">{{ detail.direction ? detail.direction.description : '' }}</p>
+        <div class="summary-chips" v-if="detail.direction">
+          <span class="chip">进度 <b>{{ detail.direction.progress }}%</b></span>
+          <span class="chip">任务 <b>{{ detail.direction.done }}</b>/{{ detail.direction.total }}</span>
+          <span class="chip">🔥 连续 <b>{{ detail.direction.streak }}</b> 天</span>
+          <span class="chip">累计 <b>{{ fmtMinutes(detail.direction.total_minutes) }}</b></span>
+        </div>
+      </div>
+
+      <div class="detail-layout">
+        <!-- 左：路线图 -->
+        <div class="roadmap">
+          <div class="phase-card card" v-for="p in detail.phases" :key="p.id">
+            <div class="phase-head">
+              <div class="phase-title">
+                <h3>{{ p.name }}</h3>
+                <p class="muted small" v-if="p.goal">🎯 {{ p.goal }}</p>
+              </div>
+              <div class="phase-actions">
+                <span class="pct small">{{ p.progress }}%</span>
+                <button class="icon-btn" title="编辑阶段" @click="editPhase(p)">✎</button>
+                <button class="icon-btn" title="删除阶段" @click="deletePhase(p)">✕</button>
+              </div>
+            </div>
+            <div class="progress-track"><div class="progress-fill" :style="{width: p.progress + '%'}"></div></div>
+
+            <ul class="task-list">
+              <li v-for="t in p.tasks" :key="t.id" class="task" :class="'task-' + t.status">
+                <button class="status-dot" :class="'dot-' + t.status"
+                        :title="statusLabel(t.status) + '（点击切换）'"
+                        @click="cycleTask(t)"></button>
+                <div class="task-body">
+                  <span class="task-title">{{ t.title }}</span>
+                  <span class="task-note" v-if="t.note"> — {{ t.note }}</span>
+                </div>
+                <button v-if="t.status !== 'skipped'" class="mini-btn"
+                        @click="setSkipped(t)">跳过</button>
+                <button v-else class="mini-btn" @click="setSkipped(t)">恢复</button>
+                <button class="icon-btn" title="编辑任务" @click="editTask(t)">✎</button>
+                <button class="icon-btn" title="删除任务" @click="deleteTask(t)">✕</button>
+              </li>
+              <li v-if="p.tasks.length === 0" class="muted small" style="padding: 6px 2px">暂无任务</li>
+            </ul>
+
+            <div class="form-row task-add">
+              <input v-model.trim="p._addTitle" placeholder="添加任务，回车确认"
+                     @keyup.enter="addTask(p)">
+              <button class="btn btn-sm" @click="addTask(p)">＋</button>
+            </div>
+          </div>
+
+          <div class="card form-card">
+            <div class="form-row">
+              <input v-model.trim="newPhase.name" placeholder="新阶段名称，如：阶段五 · Linux 驱动" @keyup.enter="addPhase">
+              <input v-model.trim="newPhase.goal" placeholder="阶段目标（可选）" class="grow" @keyup.enter="addPhase">
+              <button class="btn btn-primary" @click="addPhase">＋ 添加阶段</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右：学习日志 -->
+        <aside class="sidebar">
+          <div class="card">
+            <h3>📝 今日速记</h3>
+            <div class="log-form">
+              <div class="form-row">
+                <input type="date" v-model="newLog.date">
+                <input type="number" min="0" v-model.number="newLog.minutes" placeholder="分钟" class="minutes">
+              </div>
+              <textarea v-model.trim="newLog.content" rows="4"
+                        placeholder="今天学了什么？踩了什么坑？（TIL）"></textarea>
+              <button class="btn btn-primary full" @click="addLog">记录</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>最近记录</h3>
+            <ul class="log-list">
+              <li v-for="l in recentLogs" :key="l.id" class="log-item">
+                <div class="log-meta">
+                  <span class="log-date">{{ l.date }}</span>
+                  <span class="log-minutes" v-if="l.minutes">{{ l.minutes }} 分钟</span>
+                  <button class="icon-btn" title="删除" @click="deleteLog(l)">✕</button>
+                </div>
+                <p v-if="l.content" class="log-content">{{ l.content }}</p>
+              </li>
+              <li v-if="recentLogs.length === 0" class="muted small">还没有记录，先记一条吧</li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============ 视图三：统计回顾 ============ -->
+    <section v-if="view === 'stats'">
+      <div class="page-head">
+        <h1>统计与回顾</h1>
+        <div class="summary-chips" v-if="stats">
+          <span class="chip">累计 <b>{{ fmtMinutes(stats.total_minutes) }}</b></span>
+          <span class="chip">活跃 <b>{{ stats.active_days }}</b> 天</span>
+          <span class="chip">🔥 连续 <b>{{ stats.streak }}</b> 天</span>
+          <span class="chip">完成率 <b>{{ stats.tasks.progress }}%</b></span>
+        </div>
+      </div>
+
+      <div class="card chart-card">
+        <h3>学习热力图（近一年，按时长）</h3>
+        <div ref="heatmapEl" class="heatmap"></div>
+      </div>
+
+      <div class="two-col">
+        <div class="card chart-card">
+          <h3>周学习时长（近 12 周）</h3>
+          <div ref="weeklyEl" class="weekly"></div>
+        </div>
+        <div class="card chart-card">
+          <h3>阶段进度</h3>
+          <ul class="phase-progress">
+            <li v-for="p in (stats ? stats.phases : [])" :key="p.id">
+              <div class="pp-head">
+                <span>{{ p.name }}</span><span class="muted small">{{ p.done }}/{{ p.total }}</span>
+              </div>
+              <div class="progress-track"><div class="progress-fill" :style="{width: p.progress + '%'}"></div></div>
+            </li>
+            <li v-if="stats && stats.phases.length === 0" class="muted small">还没有阶段</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="review-head">
+          <h3>周报回顾</h3>
+          <div class="form-row">
+            <button class="btn btn-sm" @click="shiftWeek(-1)">← 上一周</button>
+            <input type="date" v-model="reviewDate" @change="loadReview">
+            <button class="btn btn-sm" @click="shiftWeek(1)">下一周 →</button>
+          </div>
+        </div>
+        <div v-if="review">
+          <p class="muted small">{{ review.week_start }} ~ {{ review.week_end }} · 合计学习
+            <b>{{ fmtMinutes(review.total_minutes) }}</b></p>
+          <div class="review-grid">
+            <div v-for="d in review.days" :key="d.date" class="review-day"
+                 :class="{active: d.minutes > 0 || d.logs.length > 0}">
+              <div class="rd-head">
+                <span>{{ d.date.slice(5) }}</span>
+                <span class="muted small" v-if="d.minutes">{{ fmtMinutes(d.minutes) }}</span>
+              </div>
+              <p v-for="l in d.logs" :key="l.id" class="rd-log">{{ l.content }}</p>
+            </div>
+          </div>
+          <h4 style="margin-top:16px">本周完成任务（{{ review.done_tasks.length }}）</h4>
+          <ul class="done-tasks">
+            <li v-for="t in review.done_tasks" :key="t.id">
+              <span class="check">✔</span> {{ t.title }}
+              <span class="muted small">（{{ t.phase_name }} · {{ t.done_at }}）</span>
+            </li>
+            <li v-if="review.done_tasks.length === 0" class="muted small">本周暂无完成任务</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- 轻提示 -->
+  <transition name="fade">
+    <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
+  </transition>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/vendor/echarts.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
