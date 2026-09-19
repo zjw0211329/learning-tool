@@ -461,6 +461,18 @@ if _client is not None:
 else:
     print("SKIP  真实服务模式跳过（整库替换不应用于真实数据）")
 
+# ---------- 8. TD2 防回归：方向列表与详情口径逐字段一致 ----------
+
+print("\n[8] 列表与详情口径一致（TD2 防回归）")
+_, dirs8 = get("/api/directions")
+check("存在可对比的方向", len(dirs8) > 0, len(dirs8))
+for d in dirs8:
+    _, rm8 = get(f"/api/directions/{d['id']}/roadmap")
+    dd = rm8["direction"]
+    for k in ("total", "done", "doing", "skipped", "progress",
+              "total_minutes", "active_days", "streak"):
+        check(f"方向{d['id']} 列表.{k} == 详情.{k}", d[k] == dd[k], (d[k], dd[k]))
+
 # ---------- 汇总 ----------
 
 if _tmpdir and os.path.isdir(_tmpdir):

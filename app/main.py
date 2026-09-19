@@ -142,12 +142,52 @@ def index():
 
 @app.get("/api/directions")
 def list_directions():
-    directions = rows_dicts(get_db().execute(
-        "SELECT * FROM directions ORDER BY id"
-    ).fetchall())
+    """方向列表。
+
+    TD2 清偿：原先每方向 3 次查询（任务统计/日志汇总/活跃日期），N 个方向 3N+1 次；
+    现在固定 4 条 SQL（方向本身 + 3 条全局聚合），与方向数量无关。
+    口径必须与单方向接口（roadmap/stats）完全一致，防回归断言见 tests [8]。
+    """
+    db = get_db()
+    directions = rows_dicts(db.execute("SELECT * FROM directions ORDER BY id").fetchall())
+    if not directions:
+        return jsonify(directions)
+
+    # 任务统计：total 口径与 direction_progress() 一致（不含 skipped）
+    task_by_dir = {r["direction_id"]: r for r in rows_dicts(db.execute(
+        """SELECT p.direction_id,
+                  COUNT(*) AS total,
+                  SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) AS done,
+                  SUM(CASE WHEN t.status = 'doing' THEN 1 ELSE 0 END) AS doing,
+                  SUM(CASE WHEN t.status = 'skipped' THEN 1 ELSE 0 END) AS skipped
+           FROM tasks t JOIN phases p ON p.id = t.phase_id
+           GROUP BY p.direction_id""").fetchall())}
+
+    # 日志汇总与活跃日期集合
+    log_by_dir = {r["direction_id"]: r for r in rows_dicts(db.execute(
+        """SELECT direction_id,
+                  COALESCE(SUM(minutes), 0) AS total_minutes
+           FROM logs GROUP BY direction_id""").fetchall())}
+    dates_by_dir = {}
+    for r in db.execute(
+            "SELECT direction_id, date FROM logs WHERE minutes > 0 OR content != ''"):
+        dates_by_dir.setdefault(r["direction_id"], set()).add(r["date"])
+
     for d in directions:
-        d.update(direction_progress(d["id"]))
-        enrich_direction(d)
+        t = task_by_dir.get(d["id"], {})
+        total = (t.get("total") or 0) - (t.get("skipped") or 0)
+        done = t.get("done") or 0
+        d.update({
+            "total": total,
+            "done": done,
+            "doing": t.get("doing") or 0,
+            "skipped": t.get("skipped") or 0,
+            "progress": round(done / total * 100) if total > 0 else 0,
+        })
+        d["total_minutes"] = log_by_dir.get(d["id"], {}).get("total_minutes", 0)
+        dates = dates_by_dir.get(d["id"], set())
+        d["active_days"] = len(dates)
+        d["streak"] = calc_streak(dates)
     return jsonify(directions)
 
 
@@ -745,6 +785,11 @@ _BACKUP_SPEC = {
         ("content", _opt(_is_optional_text), "内容"),
     ],
 }
+
+# TD3：模块加载即自检声明表形状——新增字段误写成两元素时启动即报，而不是导入时 500
+for _t, _fields in _BACKUP_SPEC.items():
+    assert all(isinstance(x, tuple) and len(x) == 3 for x in _fields), \
+        f"_BACKUP_SPEC[{_t!r}] 存在非 (字段, 校验器, 中文标签) 三元组的条目"
 
 
 def _valid_backup(body):

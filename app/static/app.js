@@ -398,13 +398,14 @@ createApp({
         // 专注结束：自动记入「开始时所在方向」的学习日志
         this.pomodoroCount += 1;
         const dirId = this._pomoDirectionId || this.currentId;
+        const focusMinutes = POMO_FOCUS / 60;   // TD1：不再硬编码 25，跟随 POMO_FOCUS
         try {
           await this.api(`/api/directions/${dirId}/logs`, {
             method: "POST",
-            body: { date: todayStr(), minutes: 25, content: "🍅 番茄钟专注" },
+            body: { date: todayStr(), minutes: focusMinutes, content: "🍅 番茄钟专注" },
           });
           if (this.currentId === dirId) await this.loadRecentLogs();
-          this.toast("🍅 专注 25 分钟完成，已记入学习日志，休息一下吧");
+          this.toast(`🍅 专注 ${focusMinutes} 分钟完成，已记入学习日志，休息一下吧`);
         } catch (_) {
           this.toast("🍅 专注完成，但日志记录失败（目标方向可能已删除）");
         }
