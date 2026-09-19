@@ -86,6 +86,7 @@ study tools/
 ## 后续路线（V3 候选）
 
 - 复习卡片（FSRS 间隔重复）· 移动端深度适配 · AI 生成学习路线图
+- 技术债（Qoder 审查记账）：`pomoFinish` 的 `minutes: 25` 改用 `POMO_FOCUS / 60`；方向列表 N+1 查询合并；`swap_order` 的 f-string 表名增加注释性约束（只允许内部常量，永不拼请求参数）
 - 引入 Vite 构建链与组件拆分（当项目长大时）
 
 ## 开发流程与协作

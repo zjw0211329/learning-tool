@@ -376,6 +376,14 @@ if _client is not None:
         ):
             s, _ = call("POST", "/api/import", _mutate(mutate))
             check(f"{label} → 400", s == 400, s)
+    # V2.1.1 主开发补充：可解析但不规范的形式（ISO 周日期能骗过 fromisoformat，
+    # 但不符合应用 YYYY-MM-DD 约定）以及 done_at 字段（此前完全未校验）
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["logs"][0].__setitem__("date", "2026-W01-1")))
+    check("ISO 周日期（可解析但不规范）→ 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("done_at", "2026-13-45")))
+    check("任务 done_at 非法 → 400", s == 400, s)
     _, dirs_ok2 = get("/api/directions")
     check("上述畸形导入均未破坏现库", len(dirs_ok2) == counts["directions"], len(dirs_ok2))
 

@@ -652,18 +652,19 @@ def _is_int(value):
 
 
 def _is_iso_date(text):
-    """必须是 YYYY-MM-DD 且是真实存在的日历日期。
+    """必须是规范的 YYYY-MM-DD 且是真实存在的日历日期。
 
     只用正则校验形状会放过 2026-13-45 这种，导入后 /api/stats 里的
     date.fromisoformat 会抛 ValueError 把统计页打死。
+    round-trip 相等用于拒绝 ISO 周日期等可解析但不规范的形式
+    （如 2026-W01-1，能被 fromisoformat 解析但不符合应用的日期字符串约定）。
     """
     if not isinstance(text, str) or len(text) != 10:
         return False
     try:
-        date.fromisoformat(text)
+        return date.fromisoformat(text).isoformat() == text
     except ValueError:
         return False
-    return True
 
 
 def _valid_backup(body):
@@ -703,6 +704,8 @@ def _valid_backup(body):
             return "tasks 中存在指向不存在阶段的记录"
         if t.get("status") not in TASK_STATUSES:
             return f"tasks 中存在非法状态: {t.get('status')!r}"
+        if t.get("done_at") is not None and not _is_iso_date(t["done_at"]):
+            return f"tasks 中存在非法完成时间: {t.get('done_at')!r}"
     for l in body["logs"]:
         if l.get("direction_id") not in dir_ids:
             return "logs 中存在指向不存在方向的记录"
