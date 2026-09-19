@@ -167,8 +167,8 @@ call("PATCH", f"/api/tasks/{t1['id']}", {"status": "done"})
 one = status_of(did)
 check("方向统计接口可见", one is not None, one)
 if one:
-    check("方向进度：skipped 不进分母",
-          one["progress"] == round(one["done"] / max(one["total"] - one["skipped"], 1) * 100), one)
+    check("方向进度：progress 与 done/total 自洽（total 已不含 skipped，口径已修复）",
+          one["progress"] == round(one["done"] / max(one["total"], 1) * 100), one)
 
 # 日志
 s, lg = call("POST", f"/api/directions/{did}/logs", {"minutes": 45, "content": "回归记录"})
@@ -252,6 +252,92 @@ if _client is not None:
     check("示例：进度在 0~100 之间", 0 <= demo["progress"] <= 100, demo["progress"])
 else:
     print("SKIP  真实服务模式跳过（避免污染/依赖空库）")
+
+# ---------- 6. V2 FR6：排序与跨阶段移动 ----------
+
+print("\n[6] 排序与跨阶段移动（V2）")
+s, d6 = call("POST", "/api/directions", {"name": QA_DIR, "description": "V2 排序测试"})
+check("V2 建临时方向 → 201", s == 201, s)
+did6 = d6["id"]
+_, pA = call("POST", f"/api/directions/{did6}/phases", {"name": "甲"})
+_, pB = call("POST", f"/api/directions/{did6}/phases", {"name": "乙"})
+ta, tb, tc = [call("POST", f"/api/phases/{pA['id']}/tasks",
+                   {"title": t})[1] for t in ("任务1", "任务2", "任务3")]
+
+def _titles(phase_id):
+    _, rm6 = get(f"/api/directions/{did6}/roadmap")
+    return [t["title"] for p in rm6["phases"] if p["id"] == phase_id for t in p["tasks"]]
+
+s, _ = call("POST", f"/api/tasks/{ta['id']}/reorder", {"direction": "down"})
+check("任务下移 → [2,1,3]", _titles(pA["id"]) == ["任务2", "任务1", "任务3"], _titles(pA["id"]))
+s, _ = call("POST", f"/api/tasks/{tb['id']}/reorder", {"direction": "up"})
+check("顶部任务上移越界 → 顺序不变", _titles(pA["id"]) == ["任务2", "任务1", "任务3"], _titles(pA["id"]))
+s, _ = call("POST", f"/api/tasks/{ta['id']}/reorder", {"direction": "up"})
+check("任务上移复原 → [1,2,3]", _titles(pA["id"]) == ["任务1", "任务2", "任务3"], _titles(pA["id"]))
+s, _ = call("POST", f"/api/tasks/{ta['id']}/reorder", {"direction": "sideways"})
+check("非法 direction → 400", s == 400, s)
+
+s, _ = call("POST", f"/api/phases/{pA['id']}/reorder", {"direction": "down"})
+_, rm6 = get(f"/api/directions/{did6}/roadmap")
+check("阶段下移 → [乙, 甲]", [p["name"] for p in rm6["phases"]] == ["乙", "甲"], rm6["phases"])
+
+# 跨阶段移动：任务1 → 乙 末尾；跨方向移动 → 400
+s, _ = call("POST", f"/api/tasks/{ta['id']}/move", {"phase_id": pB["id"]})
+check("任务移到其他阶段末尾", s == 200 and _titles(pB["id"]) == ["任务1"], _titles(pB["id"]))
+s, d7 = call("POST", "/api/directions", {"name": QA_DIR, "description": "跨方向校验"})
+_, pOther = call("POST", f"/api/directions/{d7['id']}/phases", {"name": "别的方向阶段"})
+s, _ = call("POST", f"/api/tasks/{ta['id']}/move", {"phase_id": pOther["id"]})
+check("跨方向移动 → 400", s == 400, s)
+s, _ = call("POST", f"/api/tasks/{ta['id']}/move", {"phase_id": 999999})
+check("移动到不存在阶段 → 404", s == 404, s)
+
+# 清理 V2 临时方向
+call("DELETE", f"/api/directions/{did6}")
+call("DELETE", f"/api/directions/{d7['id']}")
+
+# ---------- 7. V2 FR7：数据导出导入（仅临时库模式，避免整库替换真实数据） ----------
+
+print("\n[7] 数据导出导入（V2）")
+if _client is not None:
+    _, dirs_before = get("/api/directions")
+    s, backup = get("/api/export")
+    check("导出：元信息完整",
+          s == 200 and backup["app"] == "study-tools" and backup["version"] == 1
+          and isinstance(backup.get("exported_at"), str), backup.get("app"))
+    counts = {k: len(backup[k]) for k in ("directions", "phases", "tasks", "logs")}
+    check("导出：数量与现库一致",
+          counts["directions"] == len(dirs_before), (counts, len(dirs_before)))
+
+    # 制造额外数据 → 导入备份 → 回到备份时点
+    _, extra = call("POST", "/api/directions", {"name": QA_DIR})
+    s, res = call("POST", "/api/import", backup)
+    check("导入 → 200 且计数与备份一致", s == 200 and res["counts"] == counts, res)
+    _, dirs_after = get("/api/directions")
+    check("导入后回到备份时点（额外方向消失）",
+          all(x["id"] != extra["id"] for x in dirs_after), [x["id"] for x in dirs_after])
+
+    # 非法备份拒绝，且原数据保持不变
+    bad = json.loads(json.dumps(backup))
+    bad["tasks"][0]["status"] = "hacked"
+    s, _ = call("POST", "/api/import", bad)
+    check("非法 status → 400", s == 400, s)
+    bad2 = json.loads(json.dumps(backup))
+    bad2["app"] = "other"
+    s, _ = call("POST", "/api/import", bad2)
+    check("元信息不符 → 400", s == 400, s)
+    bad3 = json.loads(json.dumps(backup))
+    if bad3["logs"]:
+        bad3["logs"][0]["date"] = "2026/1/1"
+        s, _ = call("POST", "/api/import", bad3)
+        check("非法日期 → 400", s == 400, s)
+    bad4 = json.loads(json.dumps(backup))
+    bad4["phases"][0]["direction_id"] = 99999999
+    s, _ = call("POST", "/api/import", bad4)
+    check("外键引用断裂 → 400", s == 400, s)
+    _, dirs_ok = get("/api/directions")
+    check("非法导入后数据未受影响", len(dirs_ok) == counts["directions"], len(dirs_ok))
+else:
+    print("SKIP  真实服务模式跳过（整库替换不应用于真实数据）")
 
 # ---------- 汇总 ----------
 

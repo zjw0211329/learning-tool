@@ -28,6 +28,11 @@ function fmtMinutes(m) {
 
 const STATUS_LABELS = { todo: "未开始", doing: "进行中", done: "已完成", skipped: "已跳过" };
 
+// 番茄钟参数（V2 FR8）：25 分钟专注 / 5 分钟休息
+const POMO_FOCUS = 25 * 60;
+const POMO_BREAK = 5 * 60;
+const PAGE_TITLE = "study tools · 个人学习管理";
+
 createApp({
   data() {
     return {
@@ -51,12 +56,26 @@ createApp({
       stats: null,
       review: null,
       reviewDate: todayStr(),
+
+      // 番茄钟（纯前端计时，专注结束自动写入学习日志）
+      pomodoro: { mode: "focus", remaining: POMO_FOCUS, running: false },
+      pomodoroCount: 0,
     };
+  },
+
+  computed: {
+    pomoDisplay() {
+      const m = Math.floor(this.pomodoro.remaining / 60);
+      const s = this.pomodoro.remaining % 60;
+      return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    },
   },
 
   mounted() {
     this.loadDirections();
     window.addEventListener("resize", () => this.resizeCharts());
+    // 暴露实例句柄，便于自动化测试与调试
+    window.__app = this;
   },
 
   methods: {
@@ -127,6 +146,8 @@ createApp({
       if (!id) return;
       this.currentId = id;
       this.view = "detail";
+      this.pomoStop();           // 切换方向时重置番茄钟
+      this.pomodoroCount = 0;
       await Promise.all([this.loadRoadmap(), this.loadRecentLogs()]);
     },
 
@@ -168,17 +189,30 @@ createApp({
       await this.loadRoadmap();
     },
 
-    // 点击状态圆点：未开始 → 进行中 → 已完成 → 未开始
+    // 点击状态圆点：未开始 → 进行中 → 已完成 → 跳过 → 未开始（四态循环）
     async cycleTask(t) {
-      const next = { todo: "doing", doing: "done", done: "todo", skipped: "todo" }[t.status];
+      const next = { todo: "doing", doing: "done", done: "skipped", skipped: "todo" }[t.status];
       await this.api(`/api/tasks/${t.id}`, { method: "PATCH", body: { status: next } });
       await this.loadRoadmap();
     },
 
-    async setSkipped(t) {
-      const status = t.status === "skipped" ? "todo" : "skipped";
-      await this.api(`/api/tasks/${t.id}`, { method: "PATCH", body: { status } });
+    /* ---------- 排序与移动（V2 FR6） ---------- */
+    async reorderPhase(p, direction) {
+      await this.api(`/api/phases/${p.id}/reorder`, { method: "POST", body: { direction } });
       await this.loadRoadmap();
+    },
+
+    async reorderTask(t, direction) {
+      await this.api(`/api/tasks/${t.id}/reorder`, { method: "POST", body: { direction } });
+      await this.loadRoadmap();
+    },
+
+    async moveTask(t, ev) {
+      const phaseId = Number(ev.target.value);
+      if (!phaseId) return;
+      await this.api(`/api/tasks/${t.id}/move`, { method: "POST", body: { phase_id: phaseId } });
+      await this.loadRoadmap();
+      this.toast("任务已移动");
     },
 
     async editTask(t) {
@@ -307,6 +341,92 @@ createApp({
     goHome() {
       this.view = "home";
       this.loadDirections();
+    },
+
+    /* ---------- 番茄钟（V2 FR8） ---------- */
+    pomoToggle() {
+      if (this.pomodoro.running) {
+        this.pomoStop();
+        return;
+      }
+      this.pomodoro.running = true;
+      this._pomoTimer = setInterval(() => this.pomoTick(), 1000);
+      this.pomoTitle();
+    },
+
+    pomoStop() {
+      if (this._pomoTimer) clearInterval(this._pomoTimer);
+      this._pomoTimer = null;
+      this.pomodoro.running = false;
+      document.title = PAGE_TITLE;
+    },
+
+    pomoReset() {
+      this.pomoStop();
+      this.pomodoro.mode = "focus";
+      this.pomodoro.remaining = POMO_FOCUS;
+    },
+
+    pomoTick() {
+      this.pomodoro.remaining -= 1;
+      this.pomoTitle();
+      if (this.pomodoro.remaining <= 0) this.pomoFinish();
+    },
+
+    pomoTitle() {
+      document.title = this.pomodoro.running
+        ? `${this.pomoDisplay} ${this.pomodoro.mode === "focus" ? "🍅" : "☕"} study tools`
+        : PAGE_TITLE;
+    },
+
+    async pomoFinish() {
+      this.pomoStop();
+      if (this.pomodoro.mode === "focus") {
+        // 专注结束：自动记入当前方向的学习日志
+        this.pomodoroCount += 1;
+        try {
+          await this.api(`/api/directions/${this.currentId}/logs`, {
+            method: "POST",
+            body: { date: todayStr(), minutes: 25, content: "🍅 番茄钟专注" },
+          });
+          await this.loadRecentLogs();
+          this.toast("🍅 专注 25 分钟完成，已记入学习日志，休息一下吧");
+        } catch (_) {
+          this.toast("🍅 专注完成，但日志记录失败（可能未选择方向）");
+        }
+        this.pomodoro.mode = "break";
+        this.pomodoro.remaining = POMO_BREAK;
+      } else {
+        this.toast("☕ 休息结束，准备下一个番茄吧");
+        this.pomodoro.mode = "focus";
+        this.pomodoro.remaining = POMO_FOCUS;
+      }
+    },
+
+    /* ---------- 数据导入（V2 FR7） ---------- */
+    pickImport() {
+      this.$refs.importInput.click();
+    },
+
+    async doImport(ev) {
+      const file = ev.target.files[0];
+      ev.target.value = "";  // 允许重复选择同一文件
+      if (!file) return;
+      let data;
+      try {
+        data = JSON.parse(await file.text());
+      } catch (_) {
+        this.toast("文件不是有效的 JSON");
+        return;
+      }
+      const n = (k) => Array.isArray(data[k]) ? data[k].length : 0;
+      if (!confirm(
+        `导入将【覆盖】当前全部数据，替换为备份中的内容：\n\n` +
+        `方向 ${n("directions")} 个 · 阶段 ${n("phases")} 个 · 任务 ${n("tasks")} 个 · 日志 ${n("logs")} 条\n\n` +
+        `此操作无法撤销，确定继续吗？`)) return;
+      const res = await this.api("/api/import", { method: "POST", body: data });
+      await this.loadDirections();
+      this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },
   },
 }).mount("#app");

@@ -72,6 +72,18 @@
           </div>
         </div>
       </div>
+
+      <!-- 数据管理（V2 FR7） -->
+      <div class="card form-card data-card">
+        <div class="form-row">
+          <span class="data-title">🗄 数据管理</span>
+          <a class="btn btn-sm" href="/api/export?download=1" title="下载全部数据的 JSON 备份">导出备份</a>
+          <button class="btn btn-sm" @click="pickImport">导入备份</button>
+          <input ref="importInput" type="file" accept=".json,application/json"
+                 style="display:none" @change="doImport">
+          <span class="muted small">导入会覆盖当前全部数据，请先导出现有数据</span>
+        </div>
+      </div>
     </section>
 
     <!-- ============ 视图二：方向详情 ============ -->
@@ -98,6 +110,8 @@
               </div>
               <div class="phase-actions">
                 <span class="pct small">{{ p.progress }}%</span>
+                <button class="icon-btn" title="上移阶段" @click="reorderPhase(p, 'up')">↑</button>
+                <button class="icon-btn" title="下移阶段" @click="reorderPhase(p, 'down')">↓</button>
                 <button class="icon-btn" title="编辑阶段" @click="editPhase(p)">✎</button>
                 <button class="icon-btn" title="删除阶段" @click="deletePhase(p)">✕</button>
               </div>
@@ -107,15 +121,20 @@
             <ul class="task-list">
               <li v-for="t in p.tasks" :key="t.id" class="task" :class="'task-' + t.status">
                 <button class="status-dot" :class="'dot-' + t.status"
-                        :title="statusLabel(t.status) + '（点击切换）'"
+                        :title="statusLabel(t.status) + '（点击切换：未开始→进行中→已完成→跳过）'"
                         @click="cycleTask(t)"></button>
                 <div class="task-body">
                   <span class="task-title">{{ t.title }}</span>
                   <span class="task-note" v-if="t.note"> — {{ t.note }}</span>
                 </div>
-                <button v-if="t.status !== 'skipped'" class="mini-btn"
-                        @click="setSkipped(t)">跳过</button>
-                <button v-else class="mini-btn" @click="setSkipped(t)">恢复</button>
+                <button class="mini-btn" title="上移任务" @click="reorderTask(t, 'up')">↑</button>
+                <button class="mini-btn" title="下移任务" @click="reorderTask(t, 'down')">↓</button>
+                <select v-if="detail.phases.length > 1" class="move-sel"
+                        :key="'mv' + t.id + '-' + t.phase_id"
+                        title="移动到其他阶段" @change="moveTask(t, $event)">
+                  <option value="" disabled selected>移至</option>
+                  <option v-for="q in detail.phases.filter(x => x.id !== p.id)" :value="q.id">{{ q.name }}</option>
+                </select>
                 <button class="icon-btn" title="编辑任务" @click="editTask(t)">✎</button>
                 <button class="icon-btn" title="删除任务" @click="deleteTask(t)">✕</button>
               </li>
@@ -138,8 +157,20 @@
           </div>
         </div>
 
-        <!-- 右：学习日志 -->
+        <!-- 右：番茄钟 + 学习日志 -->
         <aside class="sidebar">
+          <div class="card pomodoro-card" v-if="detail.direction">
+            <h3>🍅 番茄钟 <span class="muted small" v-if="pomodoroCount">本次已完成 {{ pomodoroCount }} 个</span></h3>
+            <div class="pomo-time" :class="{breaking: pomodoro.mode === 'break'}">{{ pomoDisplay }}</div>
+            <div class="form-row">
+              <button class="btn btn-sm" :class="{'btn-primary': !pomodoro.running}" @click="pomoToggle">
+                {{ pomodoro.running ? '⏸ 暂停' : '▶ 开始' }}
+              </button>
+              <button class="btn btn-sm" @click="pomoReset">重置</button>
+              <span class="muted small">{{ pomodoro.mode === 'focus' ? '专注 25 分钟' : '休息 5 分钟' }}</span>
+            </div>
+          </div>
+
           <div class="card">
             <h3>📝 今日速记</h3>
             <div class="log-form">

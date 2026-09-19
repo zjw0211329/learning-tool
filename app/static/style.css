@@ -172,6 +172,25 @@ body {
 .done-tasks li { padding: 5px 0; border-top: 1px dashed var(--line); font-size: 14px; }
 .done-tasks .check { color: var(--green); font-weight: 700; }
 
+/* ---------- 番茄钟（V2） ---------- */
+.pomo-time {
+  font-size: 44px; font-weight: 700; text-align: center;
+  font-variant-numeric: tabular-nums; color: var(--primary);
+  margin: 4px 0 12px; letter-spacing: 2px;
+}
+.pomo-time.breaking { color: var(--green); }
+.pomodoro-card .muted.small { margin-left: 6px; font-weight: 400; }
+
+/* ---------- 任务移动下拉 / 数据管理（V2） ---------- */
+.move-sel {
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12px;
+  color: var(--muted); background: #fff; padding: 1px 2px; max-width: 88px;
+  cursor: pointer; flex-shrink: 0;
+}
+.move-sel:hover { border-color: var(--primary); color: var(--primary); }
+.data-card { margin-top: 4px; }
+.data-title { font-weight: 600; font-size: 14px; }
+
 /* ---------- 轻提示 ---------- */
 .toast {
   position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);

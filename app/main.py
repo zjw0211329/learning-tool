@@ -3,8 +3,9 @@
 Flask 入口 + 全部 API 路由。接口设计见 docs/03-概要设计.md 第 4 节。
 启动：python app/main.py  （默认 http://127.0.0.1:5000）
 """
+import re
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from flask import Flask, g, jsonify, request, send_from_directory
 
@@ -15,6 +16,13 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.teardown_appcontext(close_db)
 
 TASK_STATUSES = ("todo", "doing", "done", "skipped")
+
+# 备份文件的元信息标识（import 时用于校验）
+BACKUP_APP_ID = "study-tools"
+BACKUP_VERSION = 1
+
+# 日志日期字段格式（YYYY-MM-DD）
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # ---------- 小工具 ----------
@@ -49,7 +57,11 @@ def get_direction_or_none(direction_id):
 
 
 def direction_progress(direction_id):
-    """任务统计与进度：done / (total - skipped)。"""
+    """任务统计与进度。
+
+    total 为有效任务数（不含已跳过），与阶段进度口径一致（审查发现的问题修复，
+    见 tests/api_smoke.py 已知项）；进度 = done / total。
+    """
     r = get_db().execute(
         """SELECT COUNT(*) AS total,
                   SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
@@ -59,10 +71,10 @@ def direction_progress(direction_id):
            WHERE phase_id IN (SELECT id FROM phases WHERE direction_id = ?)""",
         (direction_id,),
     ).fetchone()
-    total, done = r["total"] or 0, r["done"] or 0
+    done = r["done"] or 0
     skipped = r["skipped"] or 0
-    denom = total - skipped
-    progress = round(done / denom * 100) if denom > 0 else 0
+    total = (r["total"] or 0) - skipped
+    progress = round(done / total * 100) if total > 0 else 0
     return {"total": total, "done": done, "doing": r["doing"] or 0,
             "skipped": skipped, "progress": progress}
 
@@ -313,6 +325,81 @@ def delete_task(task_id):
     return jsonify({"ok": True})
 
 
+# ---------- 排序与移动（V2 FR6）----------
+
+def swap_order(table, peer_col, item_id, direction):
+    """同级内上移/下移：按 (sort_order, id) 的当前次序与相邻项交换位置。
+
+    直接重写同级全部 sort_order 为 0..n-1，天然规避重复值导致的死循环。
+    """
+    db = get_db()
+    item = row_dict(db.execute(f"SELECT * FROM {table} WHERE id = ?", (item_id,)).fetchone())
+    if item is None:
+        return not_found("目标不存在")
+    siblings = rows_dicts(db.execute(
+        f"SELECT id FROM {table} WHERE {peer_col} = ? ORDER BY sort_order, id",
+        (item[peer_col],),
+    ))
+    idx = next((i for i, s in enumerate(siblings) if s["id"] == item_id), None)
+    if idx is None:
+        return not_found("目标不存在")
+    j = idx - 1 if direction == "up" else idx + 1
+    if 0 <= j < len(siblings):
+        order = [s["id"] for s in siblings]
+        order[idx], order[j] = order[j], order[idx]
+        for pos, oid in enumerate(order):
+            db.execute(f"UPDATE {table} SET sort_order = ? WHERE id = ?", (pos, oid))
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/phases/<int:phase_id>/reorder")
+def reorder_phase(phase_id):
+    direction = (request.get_json(silent=True) or {}).get("direction")
+    if direction not in ("up", "down"):
+        return bad_request("direction 必须是 up 或 down")
+    return swap_order("phases", "direction_id", phase_id, direction)
+
+
+@app.post("/api/tasks/<int:task_id>/reorder")
+def reorder_task(task_id):
+    direction = (request.get_json(silent=True) or {}).get("direction")
+    if direction not in ("up", "down"):
+        return bad_request("direction 必须是 up 或 down")
+    return swap_order("tasks", "phase_id", task_id, direction)
+
+
+@app.post("/api/tasks/<int:task_id>/move")
+def move_task(task_id):
+    db = get_db()
+    task = row_dict(db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+    if task is None:
+        return not_found("任务不存在")
+    body = request.get_json(silent=True) or {}
+    try:
+        target_phase_id = int(body.get("phase_id"))
+    except (TypeError, ValueError):
+        return bad_request("phase_id 不能为空")
+    cur_phase = row_dict(db.execute(
+        "SELECT direction_id FROM phases WHERE id = ?", (task["phase_id"],)).fetchone())
+    target_phase = row_dict(db.execute(
+        "SELECT direction_id FROM phases WHERE id = ?", (target_phase_id,)).fetchone())
+    if target_phase is None:
+        return not_found("目标阶段不存在")
+    if cur_phase["direction_id"] != target_phase["direction_id"]:
+        return bad_request("只能在同一方向内的阶段之间移动任务")
+    max_order = db.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) AS m FROM tasks WHERE phase_id = ?",
+        (target_phase_id,),
+    ).fetchone()["m"]
+    db.execute(
+        "UPDATE tasks SET phase_id = ?, sort_order = ? WHERE id = ?",
+        (target_phase_id, max_order + 1, task_id),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
 # ---------- 学习日志 ----------
 
 @app.get("/api/directions/<int:direction_id>/logs")
@@ -527,6 +614,98 @@ def load_demo():
     insert_demo(db)
     db.commit()
     return jsonify({"ok": True}), 201
+
+
+# ---------- 数据导出 / 导入（V2 FR7）----------
+
+@app.get("/api/export")
+def export_data():
+    db = get_db()
+    payload = {
+        "app": BACKUP_APP_ID,
+        "version": BACKUP_VERSION,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "directions": rows_dicts(db.execute("SELECT * FROM directions ORDER BY id")),
+        "phases": rows_dicts(db.execute("SELECT * FROM phases ORDER BY id")),
+        "tasks": rows_dicts(db.execute("SELECT * FROM tasks ORDER BY id")),
+        "logs": rows_dicts(db.execute("SELECT * FROM logs ORDER BY id")),
+    }
+    resp = jsonify(payload)
+    if request.args.get("download"):
+        resp.headers["Content-Disposition"] = "attachment; filename=study-tools-backup.json"
+    return resp
+
+
+def _valid_backup(body):
+    """校验备份结构：元信息、四个数组、外键引用完整。返回错误信息或 None。"""
+    if body.get("app") != BACKUP_APP_ID or body.get("version") != BACKUP_VERSION:
+        return "不是有效的 study tools 备份文件"
+    for key in ("directions", "phases", "tasks", "logs"):
+        if not isinstance(body.get(key), list):
+            return f"备份缺少 {key} 数据"
+    dir_ids = {d.get("id") for d in body["directions"]}
+    phase_ids = {p.get("id") for p in body["phases"]}
+    for d in body["directions"]:
+        if not isinstance(d.get("id"), int) or not (d.get("name") or "").strip():
+            return "directions 中存在缺少 id 或 name 的记录"
+    for p in body["phases"]:
+        if p.get("direction_id") not in dir_ids:
+            return "phases 中存在指向不存在方向的记录"
+    for t in body["tasks"]:
+        if t.get("phase_id") not in phase_ids:
+            return "tasks 中存在指向不存在阶段的记录"
+        if t.get("status") not in TASK_STATUSES:
+            return f"tasks 中存在非法状态: {t.get('status')!r}"
+    for l in body["logs"]:
+        if l.get("direction_id") not in dir_ids:
+            return "logs 中存在指向不存在方向的记录"
+        if not DATE_RE.match(l.get("date") or ""):
+            return f"logs 中存在非法日期: {l.get('date')!r}"
+    return None
+
+
+@app.post("/api/import")
+def import_data():
+    body = request.get_json(silent=True) or {}
+    err = _valid_backup(body)
+    if err:
+        return bad_request(err)
+
+    db = get_db()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # 单事务整库替换：先清后写，任何一步失败整体回滚
+        db.execute("DELETE FROM logs")
+        db.execute("DELETE FROM tasks")
+        db.execute("DELETE FROM phases")
+        db.execute("DELETE FROM directions")
+        for d in body["directions"]:
+            db.execute(
+                "INSERT INTO directions(id, name, description, created_at) VALUES (?, ?, ?, ?)",
+                (d["id"], d["name"], d.get("description") or "", d.get("created_at") or now))
+        for p in body["phases"]:
+            db.execute(
+                "INSERT INTO phases(id, direction_id, name, goal, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (p["id"], p["direction_id"], p["name"], p.get("goal") or "",
+                 p.get("sort_order") or 0, p.get("created_at") or now))
+        for t in body["tasks"]:
+            db.execute(
+                "INSERT INTO tasks(id, phase_id, title, note, status, sort_order, created_at, done_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (t["id"], t["phase_id"], t["title"], t.get("note") or "", t["status"],
+                 t.get("sort_order") or 0, t.get("created_at") or now, t.get("done_at")))
+        for l in body["logs"]:
+            db.execute(
+                "INSERT INTO logs(id, direction_id, date, minutes, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (l["id"], l["direction_id"], l["date"], l.get("minutes") or 0,
+                 l.get("content") or "", l.get("created_at") or now))
+        db.commit()
+    except sqlite3.Error as e:
+        db.rollback()
+        return bad_request(f"导入失败，已回滚原数据：{e}")
+    return jsonify({
+        "ok": True,
+        "counts": {k: len(body[k]) for k in ("directions", "phases", "tasks", "logs")},
+    })
 
 
 # ---------- 启动 ----------
