@@ -438,8 +438,20 @@ createApp({
         `导入将【覆盖】当前全部数据，替换为备份中的内容：\n\n` +
         `方向 ${n("directions")} 个 · 阶段 ${n("phases")} 个 · 任务 ${n("tasks")} 个 · 日志 ${n("logs")} 条\n\n` +
         `此操作无法撤销，确定继续吗？`)) return;
-      const res = await this.api("/api/import", { method: "POST", body: data });
+      let res;
+      try {
+        res = await this.api("/api/import", { method: "POST", body: data });
+      } catch (_) {
+        return; // 失败原因 this.api 已经 toast 过，这里只负责不再抛未捕获的 rejection
+      }
       await this.loadDirections();
+      // 导入是整库替换，原先停用的详情/统计视图 id 可能已不存在，一并复位
+      this.currentId = null;
+      this.currentDirection = null;
+      this.detail = { direction: null, phases: [] };
+      this.stats = null;
+      this.review = null;
+      this.view = "home";
       this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },
   },

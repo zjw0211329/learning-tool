@@ -3,7 +3,6 @@
 Flask 入口 + 全部 API 路由。接口设计见 docs/03-概要设计.md 第 4 节。
 启动：python app/main.py  （默认 http://127.0.0.1:5000）
 """
-import re
 import sqlite3
 from datetime import date, datetime, timedelta
 
@@ -20,9 +19,6 @@ TASK_STATUSES = ("todo", "doing", "done", "skipped")
 # 备份文件的元信息标识（import 时用于校验）
 BACKUP_APP_ID = "study-tools"
 BACKUP_VERSION = 1
-
-# 日志日期字段格式（YYYY-MM-DD）
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # ---------- 小工具 ----------
@@ -548,7 +544,12 @@ def get_stats(direction_id):
     for d_str, minutes in heatmap.items():
         if not minutes:
             continue
-        key = monday_of(date.fromisoformat(d_str)).isoformat()
+        try:
+            week_day = date.fromisoformat(d_str)
+        except ValueError:
+            # 库里万一混入非法日期（历史脏数据）时跳过，一条坏数据不该打死整个统计页
+            continue
+        key = monday_of(week_day).isoformat()
         if key in week_index:
             week_index[key]["minutes"] += minutes
 
@@ -645,18 +646,55 @@ def export_data():
     return resp
 
 
+def _is_int(value):
+    """bool 是 int 的子类，这里要排除掉（True 当 1 存进库是隐性脏数据）。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_iso_date(text):
+    """必须是 YYYY-MM-DD 且是真实存在的日历日期。
+
+    只用正则校验形状会放过 2026-13-45 这种，导入后 /api/stats 里的
+    date.fromisoformat 会抛 ValueError 把统计页打死。
+    """
+    if not isinstance(text, str) or len(text) != 10:
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _valid_backup(body):
-    """校验备份结构：元信息、四个数组、外键引用完整。返回错误信息或 None。"""
+    """校验备份：元信息、四个数组、必填字段、取值范围、外键引用完整。返回错误信息或 None。
+
+    原则（FR7.2）：任何畸形输入都走 400，不能漏到 INSERT 阶段抛 KeyError/TypeError 变 500。
+    """
     if body.get("app") != BACKUP_APP_ID or body.get("version") != BACKUP_VERSION:
         return "不是有效的 study tools 备份文件"
     for key in ("directions", "phases", "tasks", "logs"):
         if not isinstance(body.get(key), list):
             return f"备份缺少 {key} 数据"
-    dir_ids = {d.get("id") for d in body["directions"]}
-    phase_ids = {p.get("id") for p in body["phases"]}
-    for d in body["directions"]:
-        if not isinstance(d.get("id"), int) or not (d.get("name") or "").strip():
-            return "directions 中存在缺少 id 或 name 的记录"
+
+    # 1) 每张表的 id 必须是整数；名称/标题类字段必须是非空字符串
+    for rows, table, text_fields in (
+        (body["directions"], "directions", ("name",)),
+        (body["phases"], "phases", ("name",)),
+        (body["tasks"], "tasks", ("title",)),
+        (body["logs"], "logs", ()),
+    ):
+        for r in rows:
+            if not _is_int(r.get("id")):
+                return f"{table} 中存在 id 缺失或非法的记录"
+            for field in text_fields:
+                value = r.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    return f"{table} 中存在 {field} 缺失或为空的记录"
+
+    # 2) 外键引用与取值
+    dir_ids = {d["id"] for d in body["directions"]}
+    phase_ids = {p["id"] for p in body["phases"]}
     for p in body["phases"]:
         if p.get("direction_id") not in dir_ids:
             return "phases 中存在指向不存在方向的记录"
@@ -668,8 +706,13 @@ def _valid_backup(body):
     for l in body["logs"]:
         if l.get("direction_id") not in dir_ids:
             return "logs 中存在指向不存在方向的记录"
-        if not DATE_RE.match(l.get("date") or ""):
+        if not _is_iso_date(l.get("date")):
             return f"logs 中存在非法日期: {l.get('date')!r}"
+        minutes = l.get("minutes", 0)
+        if not _is_int(minutes) or minutes < 0:
+            return f"logs 中存在非法时长: {minutes!r}"
+        if not isinstance(l.get("content", ""), str):
+            return "logs 中存在非文本内容"
     return None
 
 
@@ -708,7 +751,8 @@ def import_data():
                 (l["id"], l["direction_id"], l["date"], l.get("minutes") or 0,
                  l.get("content") or "", l.get("created_at") or now))
         db.commit()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, KeyError, TypeError, ValueError) as e:
+        # 校验已挡掉绝大多数畸形数据；这里兜底，保证任何失败都是 400 + 回滚而不是 500
         db.rollback()
         return bad_request(f"导入失败，已回滚原数据：{e}")
     return jsonify({

@@ -351,6 +351,47 @@ if _client is not None:
     _, dirs_ok = get("/api/directions")
     check("非法导入后数据未受影响", len(dirs_ok) == counts["directions"], len(dirs_ok))
 
+    # V2.1 审查补充：畸形字段一律 400，不得漏到 INSERT 阶段抛 KeyError 变 500、也不得放行入库
+    def _mutate(fn):
+        b = json.loads(json.dumps(backup))
+        fn(b)
+        return b
+
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["tasks"][0].pop("title")))
+    check("任务缺 title → 400（而非 500）", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["tasks"][0].__setitem__("title", "   ")))
+    check("任务标题全空白 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["phases"][0].pop("name")))
+    check("阶段缺 name → 400（而非 500）", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["directions"][0].pop("id")))
+    check("方向缺 id → 400", s == 400, s)
+    if backup["logs"]:
+        for label, mutate in (
+            ("时长为字符串", lambda b: b["logs"][0].__setitem__("minutes", "abc")),
+            ("时长为负数", lambda b: b["logs"][0].__setitem__("minutes", -500)),
+            ("时长为布尔", lambda b: b["logs"][0].__setitem__("minutes", True)),
+            ("日历上不存在的日期", lambda b: b["logs"][0].__setitem__("date", "2026-13-45")),
+            ("非 YYYY-MM-DD 写法", lambda b: b["logs"][0].__setitem__("date", "20260130")),
+            ("日期为 null", lambda b: b["logs"][0].__setitem__("date", None)),
+        ):
+            s, _ = call("POST", "/api/import", _mutate(mutate))
+            check(f"{label} → 400", s == 400, s)
+    _, dirs_ok2 = get("/api/directions")
+    check("上述畸形导入均未破坏现库", len(dirs_ok2) == counts["directions"], len(dirs_ok2))
+
+    # 兜底：库里已存在非法日期（历史脏数据）时，统计接口仍须 200 而不是整页 500
+    import database
+    import sqlite3
+    poison_dir_id = backup["directions"][0]["id"]
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("INSERT INTO logs(direction_id, date, minutes, content) VALUES (?, ?, ?, ?)",
+                 (poison_dir_id, "2026-13-45", 30, "脏数据"))
+    conn.commit()
+    conn.close()
+    s, _ = get(f"/api/directions/{poison_dir_id}/stats")
+    check("库中存在非法日期时 /stats 仍 200", s == 200, s)
+    call("POST", "/api/import", backup)  # 还原干净数据
+
     # 导入后新建方向不得撞已导入的 id（Qoder 审查项：sqlite_sequence 守护断言）
     s, fresh = call("POST", "/api/directions", {"name": QA_DIR})
     max_backup_dir = max(x["id"] for x in backup["directions"])
