@@ -291,6 +291,20 @@ check("跨方向移动 → 400", s == 400, s)
 s, _ = call("POST", f"/api/tasks/{ta['id']}/move", {"phase_id": 999999})
 check("移动到不存在阶段 → 404", s == 404, s)
 
+# 日志 limit 参数（Qoder 审查建议项）
+for m in (10, 20, 30):
+    call("POST", f"/api/directions/{did6}/logs", {"minutes": m})
+_, all_logs = get(f"/api/directions/{did6}/logs")
+s, limited = get(f"/api/directions/{did6}/logs?limit=2")
+check("logs?limit=2 → 只返回最新 2 条",
+      s == 200 and len(limited) == 2 and
+      [x["minutes"] for x in limited] == [x["minutes"] for x in all_logs[:2]],
+      (len(limited), [x["minutes"] for x in limited]))
+s, _ = get(f"/api/directions/{did6}/logs?limit=0")
+check("limit=0 → 400", s == 400, s)
+s, _ = get(f"/api/directions/{did6}/logs?limit=abc")
+check("limit=abc → 400", s == 400, s)
+
 # 清理 V2 临时方向
 call("DELETE", f"/api/directions/{did6}")
 call("DELETE", f"/api/directions/{d7['id']}")
@@ -336,6 +350,13 @@ if _client is not None:
     check("外键引用断裂 → 400", s == 400, s)
     _, dirs_ok = get("/api/directions")
     check("非法导入后数据未受影响", len(dirs_ok) == counts["directions"], len(dirs_ok))
+
+    # 导入后新建方向不得撞已导入的 id（Qoder 审查项：sqlite_sequence 守护断言）
+    s, fresh = call("POST", "/api/directions", {"name": QA_DIR})
+    max_backup_dir = max(x["id"] for x in backup["directions"])
+    check("导入后新建方向 id > 备份最大 id（AUTOINCREMENT 自推进）",
+          s == 201 and fresh["id"] > max_backup_dir, (fresh["id"], max_backup_dir))
+    call("DELETE", f"/api/directions/{fresh['id']}")
 else:
     print("SKIP  真实服务模式跳过（整库替换不应用于真实数据）")
 

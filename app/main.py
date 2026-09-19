@@ -418,6 +418,15 @@ def list_logs(direction_id):
     except ValueError as e:
         return bad_request(str(e))
     sql += " ORDER BY date DESC, id DESC"
+    if request.args.get("limit"):
+        try:
+            limit = int(request.args["limit"])
+        except ValueError:
+            return bad_request("limit 必须是正整数")
+        if limit <= 0:
+            return bad_request("limit 必须是正整数")
+        sql += " LIMIT ?"
+        params.append(limit)
     return jsonify(rows_dicts(get_db().execute(sql, params).fetchall()))
 
 

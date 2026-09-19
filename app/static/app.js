@@ -146,8 +146,7 @@ createApp({
       if (!id) return;
       this.currentId = id;
       this.view = "detail";
-      this.pomoStop();           // 切换方向时重置番茄钟
-      this.pomodoroCount = 0;
+      // 番茄钟不随切换方向重置：它绑定的是「开始时」的方向（见 pomoToggle）
       await Promise.all([this.loadRoadmap(), this.loadRecentLogs()]);
     },
 
@@ -157,7 +156,8 @@ createApp({
     },
 
     async loadRecentLogs() {
-      this.recentLogs = await this.api(`/api/directions/${this.currentId}/logs`);
+      // 侧栏只展示最近记录，避免方向日志变多后全量拉取
+      this.recentLogs = await this.api(`/api/directions/${this.currentId}/logs?limit=30`);
     },
 
     async addPhase() {
@@ -278,13 +278,18 @@ createApp({
     renderCharts() {
       if (!this.stats) return;
 
-      // 热力图（日历图）
+      // 统计视图是 v-if 挂载的：切换视图后 DOM 会被重建，缓存的旧 ECharts 实例
+      // 指向已卸载的节点导致图表空白（审查缺陷 A）。因此每次先校验实例的 DOM，
+      // 不一致则 dispose 后重新 init。
       const heatEl = this.$refs.heatmapEl;
       if (heatEl) {
+        if (!window.__heatmap || window.__heatmap.getDom() !== heatEl) {
+          if (window.__heatmap) window.__heatmap.dispose();
+          window.__heatmap = echarts.init(heatEl);
+        }
         const end = todayStr();
         const start = addDays(end, -364);
         const maxMin = Math.max(60, ...this.stats.heatmap.map((x) => x.minutes));
-        window.__heatmap = window.__heatmap || echarts.init(heatEl);
         window.__heatmap.setOption({
           tooltip: {
             formatter: (p) => `${p.value[0]}<br>学习 ${p.value[1] || 0} 分钟`,
@@ -314,7 +319,10 @@ createApp({
       // 周时长条形图
       const weekEl = this.$refs.weeklyEl;
       if (weekEl) {
-        window.__weekly = window.__weekly || echarts.init(weekEl);
+        if (!window.__weekly || window.__weekly.getDom() !== weekEl) {
+          if (window.__weekly) window.__weekly.dispose();
+          window.__weekly = echarts.init(weekEl);
+        }
         window.__weekly.setOption({
           grid: { left: 44, right: 12, top: 16, bottom: 26 },
           tooltip: { trigger: "axis" },
@@ -344,11 +352,16 @@ createApp({
     },
 
     /* ---------- 番茄钟（V2 FR8） ---------- */
+    // 计时采用 endTime 反算剩余秒数（审查修复）：后台标签页的 setInterval
+    // 会被浏览器节流到约 1 次/分钟，逐秒 -1 会严重偏慢；用绝对时间戳反算则不受影响。
+    // 开始时绑定 direction_id，专注期间切换方向也不会把日志记错方向。
     pomoToggle() {
       if (this.pomodoro.running) {
         this.pomoStop();
         return;
       }
+      this._pomoDirectionId = this.currentId;
+      this._pomoEndAt = Date.now() + this.pomodoro.remaining * 1000;
       this.pomodoro.running = true;
       this._pomoTimer = setInterval(() => this.pomoTick(), 1000);
       this.pomoTitle();
@@ -368,7 +381,7 @@ createApp({
     },
 
     pomoTick() {
-      this.pomodoro.remaining -= 1;
+      this.pomodoro.remaining = Math.max(0, Math.round((this._pomoEndAt - Date.now()) / 1000));
       this.pomoTitle();
       if (this.pomodoro.remaining <= 0) this.pomoFinish();
     },
@@ -382,17 +395,18 @@ createApp({
     async pomoFinish() {
       this.pomoStop();
       if (this.pomodoro.mode === "focus") {
-        // 专注结束：自动记入当前方向的学习日志
+        // 专注结束：自动记入「开始时所在方向」的学习日志
         this.pomodoroCount += 1;
+        const dirId = this._pomoDirectionId || this.currentId;
         try {
-          await this.api(`/api/directions/${this.currentId}/logs`, {
+          await this.api(`/api/directions/${dirId}/logs`, {
             method: "POST",
             body: { date: todayStr(), minutes: 25, content: "🍅 番茄钟专注" },
           });
-          await this.loadRecentLogs();
+          if (this.currentId === dirId) await this.loadRecentLogs();
           this.toast("🍅 专注 25 分钟完成，已记入学习日志，休息一下吧");
         } catch (_) {
-          this.toast("🍅 专注完成，但日志记录失败（可能未选择方向）");
+          this.toast("🍅 专注完成，但日志记录失败（目标方向可能已删除）");
         }
         this.pomodoro.mode = "break";
         this.pomodoro.remaining = POMO_BREAK;
