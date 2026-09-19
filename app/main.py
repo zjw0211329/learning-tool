@@ -112,6 +112,25 @@ def monday_of(d):
     return d - timedelta(days=d.weekday())
 
 
+def next_sort_order(db, table, peer_col, peer_id):
+    """同组内下一个 sort_order = MAX + 1。
+
+    表名/列名只允许代码内常量，不接请求参数（docs/05 §3.4）。
+    库里万一有非整数的脏 sort_order（手工改库、历史数据），MAX() 会返回字符串，
+    直接 +1 就是 str + int → TypeError → 500，把「添加任务」这种核心操作打死；
+    所以这里退回按已有条数排。
+    """
+    raw = db.execute(
+        f"SELECT COALESCE(MAX(sort_order), -1) AS m FROM {table} WHERE {peer_col} = ?",
+        (peer_id,),
+    ).fetchone()["m"]
+    if not _is_int(raw):
+        raw = db.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {peer_col} = ?", (peer_id,)
+        ).fetchone()["n"] - 1
+    return raw + 1
+
+
 # ---------- 静态页面 ----------
 
 @app.get("/")
@@ -211,13 +230,10 @@ def create_phase(direction_id):
     if not name:
         return bad_request("阶段名称不能为空")
     db = get_db()
-    max_order = db.execute(
-        "SELECT COALESCE(MAX(sort_order), -1) AS m FROM phases WHERE direction_id = ?",
-        (direction_id,),
-    ).fetchone()["m"]
+    new_order = next_sort_order(db, "phases", "direction_id", direction_id)
     cur = db.execute(
         "INSERT INTO phases(direction_id, name, goal, sort_order) VALUES (?, ?, ?, ?)",
-        (direction_id, name, (body.get("goal") or "").strip(), max_order + 1),
+        (direction_id, name, (body.get("goal") or "").strip(), new_order),
     )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -261,13 +277,10 @@ def create_task(phase_id):
     title = (body.get("title") or "").strip()
     if not title:
         return bad_request("任务标题不能为空")
-    max_order = db.execute(
-        "SELECT COALESCE(MAX(sort_order), -1) AS m FROM tasks WHERE phase_id = ?",
-        (phase_id,),
-    ).fetchone()["m"]
+    new_order = next_sort_order(db, "tasks", "phase_id", phase_id)
     cur = db.execute(
         "INSERT INTO tasks(phase_id, title, note, sort_order) VALUES (?, ?, ?, ?)",
-        (phase_id, title, (body.get("note") or "").strip(), max_order + 1),
+        (phase_id, title, (body.get("note") or "").strip(), new_order),
     )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -384,13 +397,10 @@ def move_task(task_id):
         return not_found("目标阶段不存在")
     if cur_phase["direction_id"] != target_phase["direction_id"]:
         return bad_request("只能在同一方向内的阶段之间移动任务")
-    max_order = db.execute(
-        "SELECT COALESCE(MAX(sort_order), -1) AS m FROM tasks WHERE phase_id = ?",
-        (target_phase_id,),
-    ).fetchone()["m"]
+    new_order = next_sort_order(db, "tasks", "phase_id", target_phase_id)
     db.execute(
         "UPDATE tasks SET phase_id = ?, sort_order = ? WHERE id = ?",
-        (target_phase_id, max_order + 1, task_id),
+        (target_phase_id, new_order, task_id),
     )
     db.commit()
     return jsonify({"ok": True})
@@ -678,20 +688,32 @@ def _valid_backup(body):
         if not isinstance(body.get(key), list):
             return f"备份缺少 {key} 数据"
 
-    # 1) 每张表的 id 必须是整数；名称/标题类字段必须是非空字符串
-    for rows, table, text_fields in (
-        (body["directions"], "directions", ("name",)),
-        (body["phases"], "phases", ("name",)),
-        (body["tasks"], "tasks", ("title",)),
-        (body["logs"], "logs", ()),
+    # 1) 每条记录必须是对象；id/sort_order 必须是整数；名称类字段必须是非空字符串，
+    #    可选文本字段（描述/目标/备注/内容）只要给了值就必须是字符串
+    for rows, table, required_text, optional_text in (
+        (body["directions"], "directions", ("name",), ("description",)),
+        (body["phases"], "phases", ("name",), ("goal",)),
+        (body["tasks"], "tasks", ("title",), ("note",)),
+        (body["logs"], "logs", (), ("content",)),
     ):
         for r in rows:
+            if not isinstance(r, dict):
+                return f"{table} 中存在非对象记录"
             if not _is_int(r.get("id")):
                 return f"{table} 中存在 id 缺失或非法的记录"
-            for field in text_fields:
+            # sort_order 是字符串的话，导入本身不会报错，但之后「新建任务/阶段」
+            # 里的 MAX(sort_order)+1 会变成 str+int → 500，且再也加不了
+            order = r.get("sort_order", 0)
+            if order is not None and not _is_int(order):
+                return f"{table} 中存在非法 sort_order: {order!r}"
+            for field in required_text:
                 value = r.get(field)
                 if not isinstance(value, str) or not value.strip():
                     return f"{table} 中存在 {field} 缺失或为空的记录"
+            for field in optional_text:
+                value = r.get(field, "")
+                if value is not None and not isinstance(value, str):
+                    return f"{table} 中存在非文本的 {field}: {value!r}"
 
     # 2) 外键引用与取值
     dir_ids = {d["id"] for d in body["directions"]}
@@ -714,8 +736,6 @@ def _valid_backup(body):
         minutes = l.get("minutes", 0)
         if not _is_int(minutes) or minutes < 0:
             return f"logs 中存在非法时长: {minutes!r}"
-        if not isinstance(l.get("content", ""), str):
-            return "logs 中存在非文本内容"
     return None
 
 

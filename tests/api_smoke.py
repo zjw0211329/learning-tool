@@ -264,6 +264,12 @@ _, pB = call("POST", f"/api/directions/{did6}/phases", {"name": "乙"})
 ta, tb, tc = [call("POST", f"/api/phases/{pA['id']}/tasks",
                    {"title": t})[1] for t in ("任务1", "任务2", "任务3")]
 
+# sort_order 必须连续（曾经的重构把 MAX+1 又 +1 了一次，造成新建项跳号）
+check("新建阶段 sort_order 连续", [pA["sort_order"], pB["sort_order"]] == [0, 1],
+      (pA["sort_order"], pB["sort_order"]))
+check("新建任务 sort_order 连续无跳号", [ta["sort_order"], tb["sort_order"], tc["sort_order"]] == [0, 1, 2],
+      [ta["sort_order"], tb["sort_order"], tc["sort_order"]])
+
 def _titles(phase_id):
     _, rm6 = get(f"/api/directions/{did6}/roadmap")
     return [t["title"] for p in rm6["phases"] if p["id"] == phase_id for t in p["tasks"]]
@@ -384,6 +390,38 @@ if _client is not None:
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("done_at", "2026-13-45")))
     check("任务 done_at 非法 → 400", s == 400, s)
+    # 审查者第二轮对抗探针补口：非对象记录、未校验的数值/文本字段
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["logs"].append(None)))
+    check("logs 里混入 null 记录 → 400（而非 500）", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(lambda b: b["directions"].append("x")))
+    check("directions 里混入字符串记录 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("sort_order", "abc")))
+    check("任务 sort_order 为字符串 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["phases"][0].__setitem__("sort_order", "abc")))
+    check("阶段 sort_order 为字符串 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("sort_order", 1.5)))
+    check("任务 sort_order 为浮点 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("note", 123)))
+    check("任务备注为整数 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["phases"][0].__setitem__("goal", {"x": 1})))
+    check("阶段目标为对象 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["logs"][0].__setitem__("minutes", 30.5)))
+    check("时长为浮点 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("done_at", "2026-W01-1")))
+    check("done_at 为 ISO 周日期 → 400", s == 400, s)
+    # sort_order 为 null / 缺失是安全的（导入时归 0），不应被拒
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("sort_order", None)))
+    check("sort_order 为 null → 200（按 0 处理）", s == 200, s)
+    call("POST", "/api/import", backup)
+
     _, dirs_ok2 = get("/api/directions")
     check("上述畸形导入均未破坏现库", len(dirs_ok2) == counts["directions"], len(dirs_ok2))
 
@@ -398,6 +436,20 @@ if _client is not None:
     conn.close()
     s, _ = get(f"/api/directions/{poison_dir_id}/stats")
     check("库中存在非法日期时 /stats 仍 200", s == 200, s)
+    call("POST", "/api/import", backup)  # 还原干净数据
+
+    # 兜底：库里已有非整数 sort_order（手工改库、历史脏数据）时，
+    # 「添加任务 / 添加阶段」这类核心操作不能被一条脏数据打死成 500
+    poison_phase = backup["phases"][0]["id"]
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("UPDATE tasks SET sort_order = 'abc' WHERE phase_id = ?", (poison_phase,))
+    conn.execute("UPDATE phases SET sort_order = 'abc' WHERE direction_id = ?", (poison_dir_id,))
+    conn.commit()
+    conn.close()
+    s, _ = call("POST", f"/api/phases/{poison_phase}/tasks", {"title": "脏排序下新建任务"})
+    check("脏 sort_order 下新建任务仍 201", s == 201, s)
+    s, _ = call("POST", f"/api/directions/{poison_dir_id}/phases", {"name": "脏排序下新建阶段"})
+    check("脏 sort_order 下新建阶段仍 201", s == 201, s)
     call("POST", "/api/import", backup)  # 还原干净数据
 
     # 导入后新建方向不得撞已导入的 id（Qoder 审查项：sqlite_sequence 守护断言）
