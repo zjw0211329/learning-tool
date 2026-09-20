@@ -1,0 +1,2 @@
+# Windows 批处理必须保持 CRLF 行尾（cmd 按 GBK 解析，UTF-8+LF 会吞行）
+*.bat text eol=crlf

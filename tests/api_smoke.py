@@ -268,6 +268,19 @@ for path, min_bytes in (("/", 500), ("/static/app.js", 3000), ("/static/style.cs
     s, n = raw_get(path)
     check(f"{path} → 200 且非空", s == 200 and n >= min_bytes, f"{s}, {n}B")
 
+# 启动器换行符护栏（run.bat 闪退事故的防回归）：cmd 按 GBK 解析批处理，
+# UTF-8 中文注释 + LF 行尾会吞掉下一行首字符（python→ython、pause→ause，
+# 窗口闪退且无提示）；run.sh 相反，CRLF 会破坏 bash 与 shebang。
+_bat = open(os.path.join(os.path.dirname(HERE), "run.bat"), "rb").read()
+check("run.bat 全行 CRLF（cmd 按 GBK 解析，UTF-8+LF 会吞行 → 闪退）",
+      len(_bat) > 0 and b"\r\n" in _bat
+      and _bat.replace(b"\r\n", b"").count(b"\n") == 0,
+      f"孤立 LF {_bat.replace(b'\r\n', b'').count(b'\n')} 处")
+_sh = open(os.path.join(os.path.dirname(HERE), "run.sh"), "rb").read()
+check("run.sh 全行 LF（CRLF 会破坏 bash 与 shebang）",
+      len(_sh) > 0 and b"\r\n" not in _sh and _sh.count(b"\n") > 0,
+      f"CRLF {_sh.count(b'\r\n')} 处")
+
 # ---------- 5. 示例数据验收项（仅空库临时模式） ----------
 
 print("\n[5] 示例数据（《02》验收标准 1）")
