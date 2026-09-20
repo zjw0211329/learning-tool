@@ -48,6 +48,18 @@ def bad_request(msg):
     return jsonify({"error": msg}), 400
 
 
+def json_body():
+    """请求体统一入口：JSON 解析失败或顶层不是对象（list/str/number/bool）都归为 {}。
+
+    get_json(silent=True) 只压制解析错误——`[1,2]`、`"text"`、`123` 这类合法
+    JSON 会被原样返回，`or {}` 归一不掉真值，后续 body.get 直接
+    AttributeError → 500（全面审计实测，所有 POST/PATCH 路由同犯）。
+    归为 {} 后由各字段自己的校验给出 400。
+    """
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else {}
+
+
 def not_found(msg="资源不存在"):
     return jsonify({"error": msg}), 404
 
@@ -262,7 +274,7 @@ def list_directions():
 
 @app.post("/api/directions")
 def create_direction():
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, name = _text_field(body, "name", "方向名称", required=True)
     if err:
         return err
@@ -284,7 +296,7 @@ def create_direction():
 def update_direction(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, name = _text_field(body, "name", "方向名称", required=True)
     if err:
         return err
@@ -340,7 +352,7 @@ def get_roadmap(direction_id):
 def create_phase(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, name = _text_field(body, "name", "阶段名称", required=True)
     if err:
         return err
@@ -364,7 +376,7 @@ def update_phase(phase_id):
     db = get_db()
     if row_dict(db.execute("SELECT id FROM phases WHERE id = ?", (phase_id,)).fetchone()) is None:
         return not_found("阶段不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, name = _text_field(body, "name", "阶段名称", required=True)
     if err:
         return err
@@ -394,7 +406,7 @@ def create_task(phase_id):
     db = get_db()
     if row_dict(db.execute("SELECT id FROM phases WHERE id = ?", (phase_id,)).fetchone()) is None:
         return not_found("阶段不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, title = _text_field(body, "title", "任务标题", required=True)
     if err:
         return err
@@ -418,7 +430,7 @@ def update_task(task_id):
     task = row_dict(db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
     if task is None:
         return not_found("任务不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     status = body.get("status")
     if status is not None:
         if status not in TASK_STATUSES:
@@ -496,7 +508,7 @@ def swap_order(table, peer_col, item_id, direction):
 
 @app.post("/api/phases/<int:phase_id>/reorder")
 def reorder_phase(phase_id):
-    direction = (request.get_json(silent=True) or {}).get("direction")
+    direction = json_body().get("direction")
     if direction not in ("up", "down"):
         return bad_request("direction 必须是 up 或 down")
     return swap_order("phases", "direction_id", phase_id, direction)
@@ -504,7 +516,7 @@ def reorder_phase(phase_id):
 
 @app.post("/api/tasks/<int:task_id>/reorder")
 def reorder_task(task_id):
-    direction = (request.get_json(silent=True) or {}).get("direction")
+    direction = json_body().get("direction")
     if direction not in ("up", "down"):
         return bad_request("direction 必须是 up 或 down")
     return swap_order("tasks", "phase_id", task_id, direction)
@@ -516,7 +528,7 @@ def move_task(task_id):
     task = row_dict(db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
     if task is None:
         return not_found("任务不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     try:
         target_phase_id = int(body.get("phase_id"))
     except (TypeError, ValueError):
@@ -572,7 +584,7 @@ def list_logs(direction_id):
 def create_log(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     try:
         day = parse_date(body.get("date") or date.today().isoformat()).isoformat()
     except ValueError as e:
@@ -603,7 +615,7 @@ def update_log(log_id):
     log = row_dict(db.execute("SELECT * FROM logs WHERE id = ?", (log_id,)).fetchone())
     if log is None:
         return not_found("日志不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     new_date = log["date"]
     if "date" in body:
         try:
@@ -681,7 +693,7 @@ def create_card(direction_id):
     对齐决议（docs/06 §3）要求构造状态时就得知道表 id。"""
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err, front = _text_field(body, "front", "卡片正面", required=True)
     if err:
         return err
@@ -711,7 +723,7 @@ def update_card(card_id):
     card = row_dict(db.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
     if card is None:
         return not_found("卡片不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     if "front" in body:
         err, front = _text_field(body, "front", "卡片正面", required=True)
         if err:
@@ -814,7 +826,7 @@ def review_card(card_id):
     row = row_dict(db.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
     if row is None:
         return not_found("卡片不存在")
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     rating = body.get("rating")
     if not _is_int(rating) or rating not in (1, 2, 3, 4):
         return bad_request("rating 必须是 1~4 的整数（1 忘记 / 2 困难 / 3 良好 / 4 简单）")
@@ -1191,7 +1203,7 @@ def _valid_backup(body):
 
 @app.post("/api/import")
 def import_data():
-    body = request.get_json(silent=True) or {}
+    body = json_body()
     err = _valid_backup(body)
     if err:
         return bad_request(err)

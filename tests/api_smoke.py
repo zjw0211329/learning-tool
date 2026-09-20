@@ -214,6 +214,19 @@ check("日志内容非字符串 → 400（原 500）", s == 400, s)
 s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"content": {"x": 1}})
 check("编辑日志内容非字符串 → 400", s == 400, s)
 
+# 顶层非对象 JSON 体探针（全面审计发现）：get_json(silent=True) 只压制解析
+# 错误，[1,2]/"text"/123 这类合法 JSON 原样返回，`or {}` 归一不掉真值，
+# body.get 直接 AttributeError → 500；json_body() 统一入口后一律 400
+for desc, raw in (("数组", [1, 2]), ("字符串", "text"), ("数字", 123), ("布尔", True)):
+    s, _ = call("POST", "/api/directions", raw)
+    check(f"顶层非对象 JSON 体（{desc}）→ 400（原 500）", s == 400, s)
+s, _ = call("POST", f"/api/phases/{ph1['id']}/reorder", [1])
+check("reorder 顶层非对象 → 400（原 500）", s == 400, s)
+s, _ = call("POST", f"/api/tasks/{t1['id']}/move", "x")
+check("move 顶层非对象 → 400（原 500）", s == 400, s)
+s, _ = call("POST", "/api/import", [1, 2])
+check("import 顶层非对象 → 400（原 500）", s == 400, s)
+
 # 统计与回顾（先制造一条 skipped，用于校验 total 字段口径）
 call("PATCH", f"/api/tasks/{t2['id']}", {"status": "skipped"})
 s, stats = get(f"/api/directions/{did}/stats")
