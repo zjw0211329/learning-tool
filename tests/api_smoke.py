@@ -8,7 +8,7 @@
      此模式下所有写操作都收敛在自建方向「__QA_临时方向__」内，结束前删除；
      示例数据相关的验收项（依赖空库）会自动跳过。
 
-退出码：0 = 全部通过（已知问题只告警不算失败），1 = 有失败。
+退出码：0 = 全部通过，1 = 有失败。
 """
 import json
 import os
@@ -27,7 +27,6 @@ QA_URL = os.environ.get("STUDY_TOOLS_URL", "").rstrip("/")
 QA_DIR = "__QA_临时方向__"
 
 failures = []
-warnings = []
 
 
 # ---------- 调用后端：test_client 或 HTTP 两种实现统一成 call(method, path, body) ----------
@@ -99,13 +98,6 @@ def check(name, cond, extra=""):
     if not cond:
         failures.append(name)
     return cond
-
-
-def known(name, cond, detail=""):
-    """已知问题：不满足只告警，不算失败（修好后请升级为 check）。"""
-    if not cond:
-        warnings.append(f"{name}：{detail}")
-        print(f"WARN  {name} → {detail}")
 
 
 def status_of(direction_id):
@@ -949,10 +941,8 @@ if _tmpdir and os.path.isdir(_tmpdir):
 
 print("\n" + "=" * 56)
 print(f"模式：{'临时库 + test_client' if _client else '真实服务 ' + QA_URL}")
-print(f"失败 {len(failures)} 项 · 已知问题 {len(warnings)} 项")
+print(f"失败 {len(failures)} 项")
 for f in failures:
     print("  FAIL -", f)
-for w in warnings:
-    print("  WARN -", w)
 print("=" * 56)
 sys.exit(1 if failures else 0)

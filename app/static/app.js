@@ -630,4 +630,17 @@ app.config.errorHandler = (err) => {
   }
 };
 
+// errorHandler 只覆盖 Vue 亲自调度的上下文；mounted / goHome / goReview /
+// switchReviewDir / shiftWeek 等处「裸调 async 方法」的 rejection 会逃到
+// window（Qoder 实测死后端场景下 goHome/shiftWeek 各留一条 unhandled
+// rejection）。与其在 6 个调用点各补 .catch(() => {})，不如收模式：window
+// 层只拦「已 toast 过」（handled 标记）并 preventDefault；未标记的真实错误
+// 照常上报，不被吞。
+window.addEventListener("unhandledrejection", (ev) => {
+  if (ev.reason && ev.reason.handled) {
+    ev.preventDefault();
+    console.debug("[study tools] 已由 toast 呈现的错误：", ev.reason && ev.reason.message);
+  }
+});
+
 app.mount("#app");
