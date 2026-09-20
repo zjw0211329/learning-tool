@@ -331,8 +331,9 @@
         </div>
       </div>
 
-      <!-- 右：卡片管理 -->
-      <aside class="sidebar">
+      <!-- 右：卡片管理。未选方向时整块隐藏——空态只讲一件事（「先选方向」），
+           留着表单会打出 /api/directions/null/cards → 404（Qoder 轮审毛边） -->
+      <aside class="sidebar" v-if="currentId">
         <div class="card">
           <h3>＋ 新建卡片</h3>
           <div class="log-form">
