@@ -146,6 +146,13 @@ const app = createApp({
       this.loadingDirections = true;
       try {
         this.directions = await this.api("/api/directions");
+        // currentId 悬空复位（Qoder 多标签边界）：A 标签页删了方向，B 标签页
+        // 还选着它——界面内的 deleteDirection 自己会复位，但跨标签不会。
+        // 检测到选中项已不存在就归零，导航回到诚实状态而不是对着 404 显示假数据。
+        if (this.currentId && !this.directions.some((d) => d.id === this.currentId)) {
+          this.currentId = null;
+          this.currentDirection = null;
+        }
       } finally {
         this.loadingDirections = false;
       }
