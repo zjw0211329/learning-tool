@@ -101,6 +101,11 @@ const app = createApp({
       const d = this.directions.find((x) => x.id === this.currentId);
       return d ? d.due_today : 0;
     },
+
+    // 方向绑定视图（详情/统计）的可用性：已选中方向，或唯一方向可自动选中
+    tabsLocked() {
+      return !this.currentId && this.directions.length !== 1;
+    },
   },
 
   mounted() {
@@ -175,7 +180,19 @@ const app = createApp({
     },
 
     /* ---------- 方向详情 ---------- */
+    // 单一方向时所有方向绑定视图共用自动选中（Anki 式直觉）——此前只有「复习」
+    // 有这个逻辑，导致新开页面时「方向详情」「统计回顾」灰着、必须先绕道「复习」
+    // （用户实测报告的缺陷）；多个方向时仍由点卡片/视图内下拉选择
+    _ensureCurrentId() {
+      if (!this.currentId && this.directions.length === 1) {
+        this.currentId = this.directions[0].id;
+        this.currentDirection = this.directions[0];
+      }
+      return this.currentId;
+    },
+
     async openDetail(id) {
+      id = id || this._ensureCurrentId();
       if (!id) return;
       this.currentId = id;
       this.view = "detail";
@@ -285,6 +302,7 @@ const app = createApp({
 
     /* ---------- 统计回顾 ---------- */
     async openStats(id) {
+      id = id || this._ensureCurrentId();
       if (!id) return;
       this.currentId = id;
       this.view = "stats";
@@ -455,11 +473,7 @@ const app = createApp({
 
     goReview() {
       this.view = "review";
-      // 只有一个方向时自动选中（Anki 式直觉）；多个方向由视图内下拉选择
-      if (!this.currentId && this.directions.length === 1) {
-        this.currentId = this.directions[0].id;
-      }
-      if (this.currentId) this.loadReviewAll();
+      if (this._ensureCurrentId()) this.loadReviewAll();
     },
 
     switchReviewDir(ev) {

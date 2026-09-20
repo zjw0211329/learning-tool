@@ -16,9 +16,9 @@
       <nav class="nav">
         <button class="nav-btn" :class="{active: view === 'home'}" @click="goHome">总览</button>
         <button class="nav-btn" :class="{active: view === 'detail'}"
-                :disabled="!currentId" @click="openDetail(currentId)">方向详情</button>
+                :disabled="tabsLocked" @click="openDetail(currentId)">方向详情</button>
         <button class="nav-btn" :class="{active: view === 'stats'}"
-                :disabled="!currentId" @click="openStats(currentId)">统计回顾</button>
+                :disabled="tabsLocked" @click="openStats(currentId)">统计回顾</button>
         <button class="nav-btn" :class="{active: view === 'review'}" @click="goReview">复习</button>
       </nav>
       <div class="crumb" v-if="currentDirection && view !== 'home'">
