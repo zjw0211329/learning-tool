@@ -573,8 +573,10 @@ def list_logs(direction_id):
             limit = int(request.args["limit"])
         except ValueError:
             return bad_request("limit 必须是正整数")
-        if limit <= 0:
-            return bad_request("limit 必须是正整数")
+        # SQLite 的 LIMIT 是 int64，Python 大整数直接绑参 → OverflowError 500
+        # （Qoder 审计）；上限 10^6 对个人日志量是天文数字
+        if not (0 < limit <= 1_000_000):
+            return bad_request("limit 必须是 1~1000000 之间的正整数")
         sql += " LIMIT ?"
         params.append(limit)
     return jsonify(rows_dicts(get_db().execute(sql, params).fetchall()))
@@ -930,7 +932,12 @@ def get_review(direction_id):
         day = parse_date(request.args.get("date") or date.today().isoformat())
     except ValueError as e:
         return bad_request(str(e))
-    week_start, week_end = monday_of(day), monday_of(day) + timedelta(days=6)
+    try:
+        # 年末最后一周的日期会把「周一+6 天」推出 9999-12-31 → OverflowError
+        # （Qoder 审计：?date=9999-12-31 曾直接 500）
+        week_start, week_end = monday_of(day), monday_of(day) + timedelta(days=6)
+    except OverflowError:
+        return bad_request("日期太靠后，周区间无法计算")
     s, e = week_start.isoformat(), week_end.isoformat()
 
     logs = rows_dicts(get_db().execute(

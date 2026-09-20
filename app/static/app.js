@@ -117,16 +117,33 @@ const app = createApp({
 
   methods: {
     /* ---------- 基础 ---------- */
+    // 标记「已经 toast 过」的错误：errorHandler 据此降为 debug；
+    // 未标记的是真实渲染/逻辑错误，必须留在 error 级别（Qoder 审计：全静默会掩盖新缺陷）
+    _handledError(msg) {
+      const e = new Error(msg);
+      e.handled = true;
+      return e;
+    },
+
     async api(url, options = {}) {
       const opts = { headers: { "Content-Type": "application/json" }, ...options };
       if (opts.body && typeof opts.body !== "string") opts.body = JSON.stringify(opts.body);
-      const res = await fetch(url, opts);
+      let res;
+      try {
+        res = await fetch(url, opts);
+      } catch (_) {
+        // 网络层失败（服务未启动 / 断网）：fetch 直接 reject，必须在这里 toast，
+        // 否则整页静默无反馈（Qoder 审计：后端不可达时前端全静默）
+        const msg = "无法连接服务器，请确认程序已启动（python app/main.py 或 run.bat）";
+        this.toast(msg);
+        throw this._handledError(msg);
+      }
       let data = null;
       try { data = await res.json(); } catch (_) { /* 空响应 */ }
       if (!res.ok) {
         const msg = (data && data.error) || `请求失败（${res.status}）`;
         this.toast(msg);
-        throw new Error(msg);
+        throw this._handledError(msg);
       }
       return data;
     },
@@ -603,9 +620,14 @@ const app = createApp({
 
 // api() 失败时已把可读原因 toast 给用户，方法层抛出的同一错误再进控制台只会
 // 变成 unhandled rejection 噪音（Qoder 轮审次要项；minutes 严格化后手滑输
-// 小数即可触发）。吞掉前先留一条 console.debug，排查时不至于两眼一抹黑。
+// 小数即可触发）。只对「已 toast 过」的 handled 错误降为 debug —— 未标记的
+// 是真实渲染/逻辑错误，必须保持 error 级别，全静默会掩盖新缺陷。
 app.config.errorHandler = (err) => {
-  console.debug("[study tools] 已由 toast 呈现的错误：", err && err.message);
+  if (err && err.handled) {
+    console.debug("[study tools] 已由 toast 呈现的错误：", err.message);
+  } else {
+    console.error("[study tools] 未处理的错误：", err);
+  }
 };
 
 app.mount("#app");

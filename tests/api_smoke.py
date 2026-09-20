@@ -238,10 +238,8 @@ if s == 200:
     check("stats：热力图含今天", any(h["date"] == date.today().isoformat() for h in stats["heatmap"]), stats["heatmap"])
     check("stats：streak ≥ 1（今天有记录）", stats["streak"] >= 1, stats["streak"])
     check("stats：累计分钟 ≥ 90", stats["total_minutes"] >= 90, stats["total_minutes"])
-    known("方向/阶段 total 口径统一",
-          sum(p["total"] for p in stats["phases"]) == stats["tasks"]["total"],
-          f"阶段合计 {sum(p['total'] for p in stats['phases'])} vs 方向 {stats['tasks']['total']}"
-          "（方向 total 含 skipped、阶段 total 不含，前端卡片会出现「8/17 却显示 47%」）")
+    # （原 known「方向/阶段 total 口径统一」已删：三处 total 统一不含 skipped 后
+    # 该断言永真，留着会让人误以为还有未决告警 —— Qoder 文档审计指认的僵尸）
 
 today = date.today()
 monday = today - timedelta(days=today.weekday())
@@ -252,6 +250,8 @@ check("周报：7 天且总时长自洽",
 check("周报：含本周完成任务", any(t["id"] == t1["id"] for t in rv["done_tasks"]), rv["done_tasks"])
 s, _ = get(f"/api/directions/{did}/review?date=not-a-date")
 check("周报：非法日期 → 400", s == 400, s)
+s, _ = get(f"/api/directions/{did}/review?date=9999-12-31")
+check("周报：年末最后一周日期 → 400（周一+6 天溢出，原 500）", s == 400, s)
 
 # ---------- 3. 级联删除 ----------
 
@@ -370,6 +370,8 @@ s, _ = get(f"/api/directions/{did6}/logs?limit=0")
 check("limit=0 → 400", s == 400, s)
 s, _ = get(f"/api/directions/{did6}/logs?limit=abc")
 check("limit=abc → 400", s == 400, s)
+s, _ = get(f"/api/directions/{did6}/logs?limit={'9' * 30}")
+check("limit 超 int64 → 400（SQLite 绑参 OverflowError，原 500）", s == 400, s)
 
 # 清理 V2 临时方向
 call("DELETE", f"/api/directions/{did6}")
@@ -928,6 +930,15 @@ if _client is not None:
     shutil.rmtree(mig, ignore_errors=True)
     s, _ = get("/api/directions")
     check("迁移测试未影响主测试库（DB_PATH 已复原）", s == 200, s)
+
+    # docs/02 §6.5 验收自动化（Qoder 文档审计：文档写了但零测试）：
+    # 对同一临时库文件重跑 init_db()（模拟程序重启建表）→ 数据完整保留
+    _, dirs_re = get("/api/directions")
+    n_restart = len(dirs_re)
+    database.init_db()
+    _, dirs_re2 = get("/api/directions")
+    check("验收 §6.5：重启（重跑 init_db）后数据完整保留",
+          n_restart > 0 and len(dirs_re2) == n_restart, (n_restart, len(dirs_re2)))
 else:
     print("SKIP  真实服务模式跳过 9.3/9.4（直写库与迁移仅临时库模式）")
 
