@@ -26,13 +26,16 @@ function fmtMinutes(m) {
   return min ? `${h} 小时 ${min} 分` : `${h} 小时`;
 }
 
-// 到期时间（后端存 UTC ISO）→ 本地直觉文案
+// 到期时间（后端存 UTC ISO）→ 本地直觉文案。
+// 分钟档必须先于小时档：FSRS 默认学习步是 1/10 分钟（Qoder 轮审缺陷 1——
+// 原实现 9.5 分钟后的卡会显示「约 1 小时后」，误差 60 倍）。
 function fmtDue(iso) {
   if (!iso) return "";
-  const diffH = (new Date(iso) - Date.now()) / 3600000;
-  if (diffH <= 0) return "已到期";
-  if (diffH < 24) return `约 ${Math.max(1, Math.round(diffH))} 小时后`;
-  return `${Math.round(diffH / 24)} 天后`;
+  const min = (new Date(iso) - Date.now()) / 60000;
+  if (min <= 0) return "已到期";
+  if (min < 60) return `约 ${Math.max(1, Math.round(min))} 分钟后`;
+  if (min < 1440) return `约 ${Math.round(min / 60)} 小时后`;
+  return `${Math.round(min / 1440)} 天后`;
 }
 
 const STATUS_LABELS = { todo: "未开始", doing: "进行中", done: "已完成", skipped: "已跳过" };
@@ -45,9 +48,8 @@ const POMO_FOCUS = 25 * 60;
 const POMO_BREAK = 5 * 60;
 const PAGE_TITLE = "study tools · 个人学习管理";
 
-createApp({
-  data() {
-    return {
+const app = createApp({
+  data() {    return {
       view: "home",
       loadingDirections: false,
       seeding: false,
@@ -432,12 +434,15 @@ createApp({
     },
 
     cardState(c) {
+      if (c.corrupt) return "⚠ 状态损坏";
       if (c.fsrs && c.fsrs.last_review === null) return "新卡";
       return CARD_STATE_LABELS[c.state] || "—";
     },
 
-    // 新卡的 due=创建时刻，字面显示「已到期」会误导；实际含义是今天就能学
+    // 新卡的 due=创建时刻，字面显示「已到期」会误导；实际含义是今天就能学。
+    // 损坏卡（corrupt）提示删除重建 —— 删除按钮就在同一行，这是唯一的自救入口。
     cardDue(c) {
+      if (c.corrupt) return "请删除重建";
       if (c.fsrs && c.fsrs.last_review === null) return "今日可学";
       return fmtDue(c.due);
     },
@@ -573,4 +578,13 @@ createApp({
       this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },
   },
-}).mount("#app");
+});
+
+// api() 失败时已把可读原因 toast 给用户，方法层抛出的同一错误再进控制台只会
+// 变成 unhandled rejection 噪音（Qoder 轮审次要项；minutes 严格化后手滑输
+// 小数即可触发）。吞掉前先留一条 console.debug，排查时不至于两眼一抹黑。
+app.config.errorHandler = (err) => {
+  console.debug("[study tools] 已由 toast 呈现的错误：", err && err.message);
+};
+
+app.mount("#app");

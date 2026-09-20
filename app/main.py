@@ -165,6 +165,28 @@ def _parse_minutes(value):
     return value if _is_int(value) and value >= 0 else None
 
 
+def _text_field(body, key, label, required=False):
+    """取文本入参。返回 (错误响应或 None, 文本)。
+
+    语义与原 `(v or '').strip()` 完全一致，只修它的两类事故：
+    v=123 → AttributeError 500；v={} → 被 or 静默吞成空串入库。
+    - 必填：缺省/None/空白 → 400「不能为空」；
+    - 可选：缺省/None/空白 → 归一成 ""（空背面、空备注都是合法输入）；
+    - 任何非字符串类型（数字/对象/数组/布尔）→ 400「必须是文本」，不静默降级。
+    """
+    v = body.get(key)
+    if v is None:
+        if required:
+            return bad_request(f"{label}不能为空"), ""
+        return None, ""
+    if not isinstance(v, str):
+        return bad_request(f"{label}必须是文本"), ""
+    text = v.strip()
+    if required and not text:
+        return bad_request(f"{label}不能为空"), ""
+    return None, text
+
+
 # ---------- 静态页面 ----------
 
 @app.get("/")
@@ -210,10 +232,13 @@ def list_directions():
     # V3：今日待复习徽标（docs/06 §5）——一次聚合查全部方向，不在详情页逐方向查。
     # 只数「复习过且到期」的卡：新卡（last_review 为空）走每日上限配额、不算
     # 「待复习」，否则徽标会和复习视图的队列计数口径打架。
+    # json_valid 防护：坏 fsrs 行会让 json_extract 直接抛 malformed JSON 把列表
+    # 接口打死（Qoder 轮审缺陷 4 的同类面），先验格式再取字段。
     now_iso = utcnow().isoformat()
     due_by_dir = {r["direction_id"]: r["n"] for r in db.execute(
         """SELECT direction_id, COUNT(*) AS n FROM cards
-           WHERE due <= ? AND json_extract(fsrs, '$.last_review') IS NOT NULL
+           WHERE due <= ? AND json_valid(fsrs)
+             AND json_extract(fsrs, '$.last_review') IS NOT NULL
            GROUP BY direction_id""", (now_iso,)).fetchall()}
 
     for d in directions:
@@ -238,13 +263,16 @@ def list_directions():
 @app.post("/api/directions")
 def create_direction():
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return bad_request("方向名称不能为空")
+    err, name = _text_field(body, "name", "方向名称", required=True)
+    if err:
+        return err
+    err, description = _text_field(body, "description", "方向描述")
+    if err:
+        return err
     db = get_db()
     cur = db.execute(
         "INSERT INTO directions(name, description) VALUES (?, ?)",
-        (name, (body.get("description") or "").strip()),
+        (name, description),
     )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -257,13 +285,16 @@ def update_direction(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return bad_request("方向名称不能为空")
+    err, name = _text_field(body, "name", "方向名称", required=True)
+    if err:
+        return err
+    err, description = _text_field(body, "description", "方向描述")
+    if err:
+        return err
     db = get_db()
     db.execute(
         "UPDATE directions SET name = ?, description = ? WHERE id = ?",
-        (name, (body.get("description") or "").strip(), direction_id),
+        (name, description, direction_id),
     )
     db.commit()
     return jsonify({"ok": True})
@@ -310,14 +341,17 @@ def create_phase(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return bad_request("阶段名称不能为空")
+    err, name = _text_field(body, "name", "阶段名称", required=True)
+    if err:
+        return err
+    err, goal = _text_field(body, "goal", "阶段目标")
+    if err:
+        return err
     db = get_db()
     new_order = next_sort_order(db, "phases", "direction_id", direction_id)
     cur = db.execute(
         "INSERT INTO phases(direction_id, name, goal, sort_order) VALUES (?, ?, ?, ?)",
-        (direction_id, name, (body.get("goal") or "").strip(), new_order),
+        (direction_id, name, goal, new_order),
     )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -331,12 +365,15 @@ def update_phase(phase_id):
     if row_dict(db.execute("SELECT id FROM phases WHERE id = ?", (phase_id,)).fetchone()) is None:
         return not_found("阶段不存在")
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return bad_request("阶段名称不能为空")
+    err, name = _text_field(body, "name", "阶段名称", required=True)
+    if err:
+        return err
+    err, goal = _text_field(body, "goal", "阶段目标")
+    if err:
+        return err
     db.execute(
         "UPDATE phases SET name = ?, goal = ? WHERE id = ?",
-        (name, (body.get("goal") or "").strip(), phase_id),
+        (name, goal, phase_id),
     )
     db.commit()
     return jsonify({"ok": True})
@@ -358,13 +395,16 @@ def create_task(phase_id):
     if row_dict(db.execute("SELECT id FROM phases WHERE id = ?", (phase_id,)).fetchone()) is None:
         return not_found("阶段不存在")
     body = request.get_json(silent=True) or {}
-    title = (body.get("title") or "").strip()
-    if not title:
-        return bad_request("任务标题不能为空")
+    err, title = _text_field(body, "title", "任务标题", required=True)
+    if err:
+        return err
+    err, note = _text_field(body, "note", "任务备注")
+    if err:
+        return err
     new_order = next_sort_order(db, "tasks", "phase_id", phase_id)
     cur = db.execute(
         "INSERT INTO tasks(phase_id, title, note, sort_order) VALUES (?, ?, ?, ?)",
-        (phase_id, title, (body.get("note") or "").strip(), new_order),
+        (phase_id, title, note, new_order),
     )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -394,13 +434,21 @@ def update_task(task_id):
             (status, done_at, task_id),
         )
     if "title" in body or "note" in body:
-        title = (body.get("title") if "title" in body else task["title"]) or ""
-        if not title.strip():
-            return bad_request("任务标题不能为空")
-        note = body.get("note") if "note" in body else task["note"]
+        if "title" in body:
+            err, title = _text_field(body, "title", "任务标题", required=True)
+            if err:
+                return err
+        else:
+            title = task["title"]
+        if "note" in body:
+            err, note = _text_field(body, "note", "任务备注")
+            if err:
+                return err
+        else:
+            note = task["note"]
         db.execute(
             "UPDATE tasks SET title = ?, note = ? WHERE id = ?",
-            (title.strip(), note or "", task_id),
+            (title, note, task_id),
         )
     db.commit()
     return jsonify(row_dict(db.execute(
@@ -533,7 +581,9 @@ def create_log(direction_id):
     minutes = 0 if raw_minutes is None else _parse_minutes(raw_minutes)
     if minutes is None:
         return bad_request("时长必须是非负整数（分钟）")
-    content = (body.get("content") or "").strip()
+    err, content = _text_field(body, "content", "日志内容")
+    if err:
+        return err
     if minutes == 0 and not content:
         return bad_request("时长和内容至少填一项")
     db = get_db()
@@ -565,10 +615,15 @@ def update_log(log_id):
         minutes = _parse_minutes(body["minutes"])
         if minutes is None:
             return bad_request("时长必须是非负整数（分钟）")
-    content = (body.get("content") if "content" in body else log["content"]) or ""
-    content = content.strip()
+    if "content" in body:
+        err, content = _text_field(body, "content", "日志内容")
+        if err:
+            return err
+    else:
+        content = log["content"]
     if minutes == 0 and not content:
         return bad_request("时长和内容至少填一项")
+    db = get_db()
     db.execute(
         "UPDATE logs SET date = ?, minutes = ?, content = ? WHERE id = ?",
         (new_date, minutes, content, log_id),
@@ -590,9 +645,20 @@ def delete_log(log_id):
 # ---------- 复习卡片（V3 FR9） ----------
 
 def _card_view(row):
-    """DB 行 → API 视图：fsrs 解析成对象并冗余 state 字段（前端列表/徽标用）。"""
-    card = card_from_json(row["fsrs"])
+    """DB 行 → API 视图：fsrs 解析成对象并冗余 state 字段（前端列表/徽标用）。
+
+    单行 fsrs 损坏（手工改库）时降级为 corrupt 标记而不是抛错 —— 坏数据打死
+    整页的同一模式这是第三次了（坏日期→/stats、坏 sort_order→添加任务），
+    这次必须让 GET /cards 保持 200：复习视图渲染出删除按钮，用户才有自救入口。
+    """
     d = dict(row)
+    try:
+        card = card_from_json(row["fsrs"])
+    except ValueError:
+        d["fsrs"] = None
+        d["state"] = None
+        d["corrupt"] = True
+        return d
     d["fsrs"] = card.to_dict()
     d["state"] = card.state.value
     return d
@@ -616,10 +682,12 @@ def create_card(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
     body = request.get_json(silent=True) or {}
-    front = (body.get("front") or "").strip()
-    if not front:
-        return bad_request("卡片正面不能为空")
-    back = (body.get("back") or "").strip()
+    err, front = _text_field(body, "front", "卡片正面", required=True)
+    if err:
+        return err
+    err, back = _text_field(body, "back", "卡片背面")
+    if err:
+        return err
     db = get_db()
     cur = db.execute(
         "INSERT INTO cards(direction_id, front, back, fsrs, due) VALUES (?, ?, ?, '', '')",
@@ -644,13 +712,21 @@ def update_card(card_id):
     if card is None:
         return not_found("卡片不存在")
     body = request.get_json(silent=True) or {}
-    front = (body.get("front") if "front" in body else card["front"]) or ""
-    if not front.strip():
-        return bad_request("卡片正面不能为空")
-    back = body.get("back") if "back" in body else card["back"]
+    if "front" in body:
+        err, front = _text_field(body, "front", "卡片正面", required=True)
+        if err:
+            return err
+    else:
+        front = card["front"]
+    if "back" in body:
+        err, back = _text_field(body, "back", "卡片背面")
+        if err:
+            return err
+    else:
+        back = card["back"]
     db.execute(
         "UPDATE cards SET front = ?, back = ? WHERE id = ?",
-        (front.strip(), (back or "").strip(), card_id),
+        (front, back, card_id),
     )
     db.commit()
     return jsonify(_card_view(row_dict(db.execute(
@@ -686,7 +762,13 @@ def review_queue(direction_id):
         "SELECT * FROM cards WHERE direction_id = ? ORDER BY due, id", (direction_id,)
     ).fetchall())
 
-    cards = [(r, card_from_json(r["fsrs"])) for r in rows]
+    cards = []
+    for r in rows:
+        try:
+            c = card_from_json(r["fsrs"])
+        except ValueError:
+            continue  # 损坏行不参与队列（列表里带 corrupt 标记可删除自救），但不打死整个队列
+        cards.append((r, c))
     # 新卡的 due = 创建时刻，天然 ≤ now，但属于新卡配额而非「到期复习」
     due_cards = [r for r, c in cards if c.last_review is not None and r["due"] <= now_iso]
     new_cards = [r for r, c in cards if c.last_review is None]
@@ -891,8 +973,13 @@ def export_data():
     db = get_db()
     cards = []
     for r in rows_dicts(db.execute("SELECT * FROM cards ORDER BY id").fetchall()):
-        # 备份里的 fsrs 存对象而非双重编码的 JSON 字符串（可读性，v2 格式约定）
-        r["fsrs"] = json.loads(r["fsrs"])
+        # 备份里的 fsrs 存对象而非双重编码的 JSON 字符串（可读性，v2 格式约定）。
+        # 损坏行原样带出（导入侧对该行 400）：备份必须先于任何解析成功 ——
+        # 用户删掉坏卡后就能导出干净备份。
+        try:
+            r["fsrs"] = json.loads(r["fsrs"])
+        except ValueError:
+            pass
         cards.append(r)
     payload = {
         "app": BACKUP_APP_ID,
@@ -1132,7 +1219,7 @@ def import_data():
             db.execute(
                 "INSERT INTO tasks(id, phase_id, title, note, status, sort_order, created_at, done_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (t["id"], t["phase_id"], t["title"], t.get("note") or "", t["status"],
-                 t.get("sort_order") or 0, t.get("created_at") or now, t["done_at"]))
+                 t.get("sort_order") or 0, t.get("created_at") or now, t.get("done_at")))
         for l in body["logs"]:
             db.execute(
                 "INSERT INTO logs(id, direction_id, date, minutes, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",

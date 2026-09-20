@@ -191,6 +191,29 @@ check("编辑日志时长生效", s == 200 and logs[0]["minutes"] == 90, logs[:1
 s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"minutes": 30.5})
 check("编辑为浮点时长 → 400", s == 400, s)
 
+# 文本入参类型探针（Qoder 轮审缺陷 2，扫到全部文本入口）：
+# `(v or '').strip()` 形状遇 123 → AttributeError 500、遇 {} → 静默吞成空串，现在一律 400
+s, _ = call("POST", "/api/directions", {"name": 123})
+check("方向名称非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("POST", "/api/directions", {"name": "文本方向", "description": {"a": 1}})
+check("方向描述为对象 → 400（原静默吞掉）", s == 400, s)
+s, _ = call("PATCH", f"/api/directions/{did}", {"name": 123})
+check("编辑方向名称非字符串 → 400", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/phases", {"name": 123})
+check("阶段名称非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/phases", {"name": "文本阶段", "goal": 456})
+check("阶段目标非字符串 → 400", s == 400, s)
+s, _ = call("POST", f"/api/phases/{ph1['id']}/tasks", {"title": 123})
+check("任务标题非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("POST", f"/api/phases/{ph1['id']}/tasks", {"title": "文本任务", "note": []})
+check("任务备注非字符串 → 400", s == 400, s)
+s, _ = call("PATCH", f"/api/tasks/{t1['id']}", {"title": 123})
+check("编辑任务标题非字符串 → 400", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"content": 123})
+check("日志内容非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"content": {"x": 1}})
+check("编辑日志内容非字符串 → 400", s == 400, s)
+
 # 统计与回顾（先制造一条 skipped，用于校验 total 字段口径）
 call("PATCH", f"/api/tasks/{t2['id']}", {"status": "skipped"})
 s, stats = get(f"/api/directions/{did}/stats")
@@ -506,6 +529,16 @@ if _client is not None:
           == {c["id"]: (c["front"], c["back"], c["due"], c["fsrs"]) for c in backup["cards"]},
           len(cards_rt))
 
+    # done_at 键整体缺失的合法 v2 备份必须可导入（Qoder 轮审缺陷 3：
+    # 声明表把 done_at 声明为可缺省，INSERT 却直取 t["done_at"] 裸 KeyError）
+    no_done = json.loads(json.dumps(backup))
+    for t_ in no_done["tasks"]:
+        t_.pop("done_at", None)
+    s, res = call("POST", "/api/import", no_done)
+    check("v2 备份缺 done_at 键 → 200（声明说可选就得真可选）",
+          s == 200 and res["counts"]["tasks"] == counts["tasks"], (s, res))
+    call("POST", "/api/import", backup)  # 还原
+
     # 版本高于本程序支持 → 文案明说（不再笼统报"不是有效的备份"）
     hi = json.loads(json.dumps(backup)); hi["version"] = 99
     s, res = call("POST", "/api/import", hi)
@@ -620,9 +653,16 @@ c2, _ = review_mod.review(c1, 3, when=T0)
 check("再 Good → Review 态，due=+2 天",
       c2.state.value == 2 and c2.due.isoformat() == "2026-09-21T12:00:00+00:00", c2.due)
 c3, _ = review_mod.review(c2, 1, when=T0)
-check("再 Again → Relearning，due=+10 分钟（stability≈0.7751，docs/06 原值 0.608 有误）",
+check("再 Again → Relearning，due=+10 分钟（同刻三连评序列 stability≈0.7751）",
       c3.state.value == 3 and c3.due.isoformat() == "2026-09-19T12:10:00+00:00"
       and round(c3.stability, 4) == 0.7751, (c3.state, c3.due, c3.stability))
+# docs/06 §4 两序列口径：每次在上一张卡的 due 时点评 → 0.6077（r2 的 0.608 即此序列）
+c3b = review_mod.new_card(11)
+c3b, _ = review_mod.review(c3b, 3, when=T0)
+c3b, _ = review_mod.review(c3b, 3, when=c3b.due)
+c3b, _ = review_mod.review(c3b, 1, when=c3b.due)
+check("按 due 时点逐次评的序列 stability≈0.6077（两条序列都有主）",
+      c3b.state.value == 3 and round(c3b.stability, 4) == 0.6077, c3b.stability)
 check("fsrs 列序列化往返一致（card_to_json ↔ card_from_json）",
       review_mod.card_from_json(review_mod.card_to_json(c3)).to_dict() == c3.to_dict())
 ra, _ = review_mod.review(review_mod.new_card(7), 3, when=T0)
@@ -652,6 +692,11 @@ check("复习临时方向 → 201", s == 201, s)
 d9id = d9["id"]
 s, _ = call("POST", f"/api/directions/{d9id}/cards", {"front": "   "})
 check("空正面建卡 → 400", s == 400, s)
+# 文本入参类型探针（Qoder 轮审缺陷 2 的卡片入口）
+s, _ = call("POST", f"/api/directions/{d9id}/cards", {"front": 123})
+check("卡片正面非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("POST", f"/api/directions/{d9id}/cards", {"front": "a", "back": {"x": 1}})
+check("卡片背面为对象 → 400（原静默吞成空串）", s == 400, s)
 made = []
 for i in range(12):
     _, card = call("POST", f"/api/directions/{d9id}/cards", {"front": f"卡{i}", "back": f"答{i}"})
@@ -710,6 +755,10 @@ s, e9 = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": "改过的正面"
 check("编辑卡片 → 200", s == 200 and e9["front"] == "改过的正面" and e9["back"] == "新背面", e9)
 s, _ = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": "  "})
 check("编辑为空正面 → 400", s == 400, s)
+s, _ = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": 123})
+check("编辑卡片正面非字符串 → 400（原 500）", s == 400, s)
+s, _ = call("PATCH", f"/api/cards/{made[1]['id']}", {"back": []})
+check("编辑卡片背面非字符串 → 400", s == 400, s)
 s, _ = call("PATCH", "/api/cards/999999", {"front": "x"})
 check("编辑不存在的卡 → 404", s == 404, s)
 s, _ = call("DELETE", f"/api/cards/{made[1]['id']}")
@@ -757,6 +806,39 @@ if _client is not None:
           next(d for d in dirs9d if d["id"] == d9cid)["due_today"] == 1,
           [d.get("due_today") for d in dirs9d])
     call("DELETE", f"/api/directions/{d9cid}")
+
+    # 9.3b 坏 fsrs 不打死页面（Qoder 轮审缺陷 4，同一模式的第三次收口）：
+    # 列表/队列/徽标/导出保持 200，坏行降级 corrupt 标记 → 前端渲染出删除按钮自救
+    s, d9e = call("POST", "/api/directions", {"name": QA_DIR, "description": "坏卡自愈"})
+    d9eid = d9e["id"]
+    _, good_card = call("POST", f"/api/directions/{d9eid}/cards", {"front": "好卡", "back": "b"})
+    _, bad_card = call("POST", f"/api/directions/{d9eid}/cards", {"front": "坏卡", "back": "b"})
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("UPDATE cards SET fsrs = '{bad json' WHERE id = ?", (bad_card["id"],))
+    conn.commit()
+    conn.close()
+    s, cards_e = get(f"/api/directions/{d9eid}/cards")
+    check("坏 fsrs 下 GET /cards 仍 200（原 500）", s == 200, s)
+    row_bad = next((c for c in cards_e if c["id"] == bad_card["id"]), None)
+    row_good = next((c for c in cards_e if c["id"] == good_card["id"]), None)
+    check("坏行降级 corrupt 标记（state/fsrs 置空）",
+          row_bad is not None and row_bad["corrupt"] is True
+          and row_bad["state"] is None and row_bad["fsrs"] is None, row_bad)
+    check("好行不受牵连",
+          row_good is not None and row_good.get("corrupt") is None
+          and row_good["state"] == 1, row_good)
+    s, q_e = get(f"/api/directions/{d9eid}/review/queue")
+    check("坏 fsrs 下队列仍 200 且坏卡不入队",
+          s == 200 and all(c["id"] != bad_card["id"] for c in q_e["queue"]), s)
+    s, _ = get("/api/directions")
+    check("坏 fsrs 下方向列表（徽标聚合 json_valid 防护）仍 200", s == 200, s)
+    s, _ = get("/api/export")
+    check("坏 fsrs 下导出仍 200（备份是自救通道，坏行原样带出）", s == 200, s)
+    s, _ = call("POST", f"/api/cards/{bad_card['id']}/review", {"rating": 3})
+    check("复习坏卡 → 400（明确文案，非 500）", s == 400, s)
+    s, _ = call("DELETE", f"/api/cards/{bad_card['id']}")
+    check("删除坏卡 → 200（自救入口可用）", s == 200, s)
+    call("DELETE", f"/api/directions/{d9eid}")
 
     # 9.4 自包含迁移测试（§9.3）：内联 v2.0 四表 SCHEMA —— 建库 → 塞旧数据 →
     # 当前 init_db() → 断言新表出现且旧数据完整。不依赖 git 历史文件。
