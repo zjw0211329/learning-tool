@@ -19,6 +19,7 @@
                 :disabled="!currentId" @click="openDetail(currentId)">方向详情</button>
         <button class="nav-btn" :class="{active: view === 'stats'}"
                 :disabled="!currentId" @click="openStats(currentId)">统计回顾</button>
+        <button class="nav-btn" :class="{active: view === 'review'}" @click="goReview">复习</button>
       </nav>
       <div class="crumb" v-if="currentDirection && view !== 'home'">
         当前方向：<b>{{ currentDirection.name }}</b>
@@ -96,6 +97,7 @@
           <span class="chip">任务 <b>{{ detail.direction.done }}</b>/{{ detail.direction.total }}</span>
           <span class="chip">🔥 连续 <b>{{ detail.direction.streak }}</b> 天</span>
           <span class="chip">累计 <b>{{ fmtMinutes(detail.direction.total_minutes) }}</b></span>
+          <span class="chip" :class="{lit: dueToday > 0}">📖 今日待复习 <b>{{ dueToday }}</b></span>
         </div>
       </div>
 
@@ -272,6 +274,97 @@
       </div>
     </section>
 
+    <!-- ============ 视图四：复习卡片（V3 FR9） ============ -->
+    <section v-if="view === 'review'">
+    <div class="page-head review-head-v3">
+      <h1>复习卡片</h1>
+      <div class="form-row" v-if="directions.length >= 1">
+        <select class="dir-sel" :value="currentId" @change="switchReviewDir"
+                title="选择要复习的方向">
+          <option v-for="d in directions" :key="d.id" :value="d.id">{{ d.name }}</option>
+        </select>
+      </div>
+      <div class="summary-chips" v-if="reviewCounts">
+        <span class="chip" :class="{lit: reviewCounts.due > 0}">今日待复习 <b>{{ reviewCounts.due }}</b></span>
+        <span class="chip">今日新卡 <b>{{ reviewCounts.new }}</b></span>
+        <span class="chip">今日已完成 <b>{{ reviewCounts.done_today }}</b></span>
+        <span class="chip">卡片总数 <b>{{ reviewCounts.total }}</b></span>
+      </div>
+    </div>
+
+    <div class="review-layout">
+      <!-- 左：复习卡面 -->
+      <div class="review-main">
+        <div v-if="currentCard" class="card review-card">
+          <div class="rc-front">
+            <p class="rc-label">正面 · {{ cardState(currentCard) }}</p>
+            <h2 class="rc-text">{{ currentCard.front }}</h2>
+          </div>
+
+          <div v-if="!reviewFlipped" class="rc-actions">
+            <button class="btn btn-primary full" @click="flipCard">显示答案</button>
+          </div>
+          <div v-else class="rc-back">
+            <p class="rc-label">反面</p>
+            <p class="rc-text">{{ currentCard.back || '（无反面内容）' }}</p>
+            <div class="rating-row">
+              <button class="rate rate-again" @click="rateCard(1)">忘记</button>
+              <button class="rate rate-hard" @click="rateCard(2)">困难</button>
+              <button class="rate rate-good" @click="rateCard(3)">良好</button>
+              <button class="rate rate-easy" @click="rateCard(4)">简单</button>
+            </div>
+          </div>
+
+          <p class="muted small rc-meta">剩余 {{ reviewQueue.length }} 张 · {{ cardDue(currentCard) }}</p>
+        </div>
+
+        <div v-else-if="reviewCounts && currentId" class="card empty">
+          <div class="empty-emoji">🎉</div>
+          <h2>今日队列已清空</h2>
+          <p class="muted">到期卡都复习完了，新卡按每日上限展示。休息一下，或在右侧继续添加卡片。</p>
+        </div>
+
+        <div v-else class="card empty">
+          <div class="empty-emoji">📖</div>
+          <h2>选择要复习的方向</h2>
+          <p class="muted">先去总览创建或选择一个学习方向，再来这里复习。</p>
+        </div>
+      </div>
+
+      <!-- 右：卡片管理 -->
+      <aside class="sidebar">
+        <div class="card">
+          <h3>＋ 新建卡片</h3>
+          <div class="log-form">
+            <input v-model.trim="newCard.front" placeholder="正面（问题），如：指针和数组的关系？"
+                   @keyup.enter="addCard">
+            <textarea v-model.trim="newCard.back" rows="3"
+                      placeholder="反面（答案，可留空）"></textarea>
+            <button class="btn btn-primary full" @click="addCard">添加</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>卡片管理（{{ cards.length }}）</h3>
+          <ul class="card-list">
+            <li v-for="c in cards" :key="c.id" class="card-item">
+              <div class="ci-main">
+                <span class="ci-front">{{ c.front }}</span>
+                <span class="muted small ci-back" v-if="c.back">{{ c.back }}</span>
+              </div>
+              <div class="ci-meta">
+                <span class="ci-state">{{ cardState(c) }}</span>
+                <span class="muted small">{{ cardDue(c) }}</span>
+                <button class="icon-btn" title="编辑卡片" @click="editCard(c)">✎</button>
+                <button class="icon-btn" title="删除卡片" @click="deleteCard(c)">✕</button>
+              </div>
+            </li>
+            <li v-if="cards.length === 0" class="muted small">还没有卡片，先在上方创建一张</li>
+          </ul>
+        </div>
+      </aside>
+    </div>
+    </section>
   </main>
 
   <!-- 轻提示 -->

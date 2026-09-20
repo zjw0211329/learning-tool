@@ -1,6 +1,12 @@
-"""「嵌入式」示例数据生成，用于首次演示与验收（见《02》验收标准第 1 条）。"""
+"""「嵌入式」示例数据生成，用于首次演示与验收（见《02》验收标准第 1 条）。
+
+V3（FR9.7）：附带 6 张复习卡。所有时间一律 datetime.now(timezone.utc) ± timedelta
+动态生成 —— 写死日期会让演示库随时间腐烂（到期卡永远停在演示当天）。
+"""
 import random
 from datetime import date, timedelta
+
+from review import card_to_json, due_of, new_card, review, utcnow
 
 PHASES = [
     ("阶段一 · C 语言与计算机基础", "能把指针、结构体、内存模型讲清楚", [
@@ -40,6 +46,41 @@ TIL_SAMPLES = [
     "今天只看了 20 分钟书，效率一般，明天把手机放客厅。",
     "焊了一下排针，第一次焊得歪歪扭扭，第二排就顺了。",
 ]
+
+# 已复习的 4 张：同一时刻两次 Good 把卡推进 Review 态（due = 时刻 + 2 天），
+# 复习时刻回推 30 天 → due 已过期 28 天，稳稳出现在「今日待复习」里。
+_REVIEWED_CARDS = [
+    ("指针和数组的关系是什么？", "数组名在表达式中会退化为指向首元素的指针；sizeof 与取地址 & 是例外。"),
+    ("struct 为什么要内存对齐？", "CPU 按对齐边界访问内存更快；结构体总大小需为最大对齐值的整数倍。"),
+    ("GPIO 点灯不亮，最先该查什么？", "RCC 时钟是否使能 —— 外设没有时钟，写寄存器不生效。"),
+    ("中断服务函数里为什么不能延时？", "阻塞会饿死同级中断；应置标志位，处理放回主循环。"),
+]
+
+# 新卡 2 张：从未复习（fsrs v6 无 New 态，即 Learning + last_review 为空）。
+_NEW_CARDS = [
+    ("FreeRTOS 队列传值还是传引用？", "拷贝传值；传大结构体要传指针并注意生命周期与栈溢出。"),
+    ("I2C 总线卡死了怎么办？", "九时钟恢复法：主机手动补 9 个 SCL 时钟，让从机释放 SDA。"),
+]
+
+
+def _insert_card(db, direction_id, front, back, card, history):
+    """插入一张卡并落它的历史复习记录。先插行拿 id，再把 card_id 对齐到表 id
+    （docs/06 §3 决议：fsrs.card_id == cards.id，全链路只用一套编号）。"""
+    cur = db.execute(
+        "INSERT INTO cards(direction_id, front, back, fsrs, due) VALUES (?, ?, ?, '', '')",
+        (direction_id, front, back),
+    )
+    card_id = cur.lastrowid
+    card.card_id = card_id
+    db.execute(
+        "UPDATE cards SET fsrs = ?, due = ? WHERE id = ?",
+        (card_to_json(card), due_of(card), card_id),
+    )
+    for rating, when in history:
+        db.execute(
+            "INSERT INTO review_logs(card_id, rating, reviewed_at) VALUES (?, ?, ?)",
+            (card_id, rating, when.isoformat()),
+        )
 
 
 def insert_demo(db) -> int:
@@ -88,4 +129,15 @@ def insert_demo(db) -> int:
             "INSERT INTO logs(direction_id, date, minutes, content) VALUES (?, ?, ?, ?)",
             (direction_id, day.isoformat(), minutes, content),
         )
+
+    # V3（FR9.7）：6 张复习卡，时间全部动态回推
+    now = utcnow()
+    past = now - timedelta(days=30)
+    for front, back in _REVIEWED_CARDS:
+        card = new_card(0)
+        card, _ = review(card, 3, when=past)
+        card, _ = review(card, 3, when=past)
+        _insert_card(db, direction_id, front, back, card, [(3, past), (3, past)])
+    for front, back in _NEW_CARDS:
+        _insert_card(db, direction_id, front, back, new_card(0), [])
     return direction_id

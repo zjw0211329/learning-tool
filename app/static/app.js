@@ -1,5 +1,5 @@
 /* study tools · 前端应用（Vue 3，免构建）
- * 三个视图：总览 home / 方向详情 detail / 统计回顾 stats
+ * 四个视图：总览 home / 方向详情 detail / 统计回顾 stats / 复习卡片 review（V3）
  */
 const { createApp } = Vue;
 
@@ -26,7 +26,19 @@ function fmtMinutes(m) {
   return min ? `${h} 小时 ${min} 分` : `${h} 小时`;
 }
 
+// 到期时间（后端存 UTC ISO）→ 本地直觉文案
+function fmtDue(iso) {
+  if (!iso) return "";
+  const diffH = (new Date(iso) - Date.now()) / 3600000;
+  if (diffH <= 0) return "已到期";
+  if (diffH < 24) return `约 ${Math.max(1, Math.round(diffH))} 小时后`;
+  return `${Math.round(diffH / 24)} 天后`;
+}
+
 const STATUS_LABELS = { todo: "未开始", doing: "进行中", done: "已完成", skipped: "已跳过" };
+
+// fsrs v6 状态值：1 学习中 / 2 复习中 / 3 重学中（没有 New 态，新卡看 last_review）
+const CARD_STATE_LABELS = { 1: "学习中", 2: "复习中", 3: "重学中" };
 
 // 番茄钟参数（V2 FR8）：25 分钟专注 / 5 分钟休息
 const POMO_FOCUS = 25 * 60;
@@ -57,6 +69,13 @@ createApp({
       review: null,
       reviewDate: todayStr(),
 
+      // 复习卡片（V3 FR9）
+      reviewQueue: [],
+      reviewCounts: null,
+      reviewFlipped: false,
+      cards: [],
+      newCard: { front: "", back: "" },
+
       // 番茄钟（纯前端计时，专注结束自动写入学习日志）
       pomodoro: { mode: "focus", remaining: POMO_FOCUS, running: false },
       pomodoroCount: 0,
@@ -68,6 +87,17 @@ createApp({
       const m = Math.floor(this.pomodoro.remaining / 60);
       const s = this.pomodoro.remaining % 60;
       return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    },
+
+    // 队列首张 = 当前复习中的卡
+    currentCard() {
+      return this.reviewQueue[0] || null;
+    },
+
+    // 详情页「今日待复习」徽标：数据来自方向列表接口的聚合（docs/06 §5）
+    dueToday() {
+      const d = this.directions.find((x) => x.id === this.currentId);
+      return d ? d.due_today : 0;
     },
   },
 
@@ -101,6 +131,7 @@ createApp({
     },
 
     fmtMinutes,
+    fmtDue,
     statusLabel(s) { return STATUS_LABELS[s] || s; },
 
     /* ---------- 总览 ---------- */
@@ -345,10 +376,92 @@ createApp({
       if (window.__weekly) window.__weekly.resize();
     },
 
+    /* ---------- 复习卡片（V3 FR9） ---------- */
+    async loadReviewAll() {
+      this.currentDirection = this.directions.find((d) => d.id === this.currentId) || null;
+      await Promise.all([this.loadCards(), this.loadQueue()]);
+    },
+
+    async loadCards() {
+      this.cards = await this.api(`/api/directions/${this.currentId}/cards`);
+    },
+
+    async loadQueue() {
+      const data = await this.api(`/api/directions/${this.currentId}/review/queue`);
+      this.reviewQueue = data.queue;
+      this.reviewCounts = data.counts;
+      this.reviewFlipped = false;
+    },
+
+    flipCard() {
+      this.reviewFlipped = true;
+    },
+
+    // 四级评分（FR9.3）：忘记=1 / 困难=2 / 良好=3 / 简单=4
+    async rateCard(rating) {
+      const card = this.currentCard;
+      if (!card) return;
+      await this.api(`/api/cards/${card.id}/review`, { method: "POST", body: { rating } });
+      // 队列/计数/卡片列表刷新；方向列表一起刷，详情页徽标保持同步
+      await Promise.all([this.loadQueue(), this.loadCards(), this.loadDirections()]);
+    },
+
+    async addCard() {
+      if (!this.newCard.front) { this.toast("请先填写卡片正面"); return; }
+      await this.api(`/api/directions/${this.currentId}/cards`, {
+        method: "POST", body: this.newCard,
+      });
+      this.newCard = { front: "", back: "" };
+      await this.loadReviewAll();
+      this.toast("卡片已创建");
+    },
+
+    async editCard(c) {
+      const front = prompt("卡片正面：", c.front);
+      if (front === null) return;
+      const back = prompt("卡片背面（可留空）：", c.back || "");
+      if (back === null) return;
+      await this.api(`/api/cards/${c.id}`, { method: "PATCH", body: { front, back } });
+      await this.loadCards();
+    },
+
+    async deleteCard(c) {
+      if (!confirm(`删除卡片「${c.front}」及其复习记录？`)) return;
+      await this.api(`/api/cards/${c.id}`, { method: "DELETE" });
+      await this.loadReviewAll();
+    },
+
+    cardState(c) {
+      if (c.fsrs && c.fsrs.last_review === null) return "新卡";
+      return CARD_STATE_LABELS[c.state] || "—";
+    },
+
+    // 新卡的 due=创建时刻，字面显示「已到期」会误导；实际含义是今天就能学
+    cardDue(c) {
+      if (c.fsrs && c.fsrs.last_review === null) return "今日可学";
+      return fmtDue(c.due);
+    },
+
     /* ---------- 导航 ---------- */
     goHome() {
       this.view = "home";
       this.loadDirections();
+    },
+
+    goReview() {
+      this.view = "review";
+      // 只有一个方向时自动选中（Anki 式直觉）；多个方向由视图内下拉选择
+      if (!this.currentId && this.directions.length === 1) {
+        this.currentId = this.directions[0].id;
+      }
+      if (this.currentId) this.loadReviewAll();
+    },
+
+    switchReviewDir(ev) {
+      const id = Number(ev.target.value);
+      if (!id || id === this.currentId) return;
+      this.currentId = id;
+      this.loadReviewAll();
     },
 
     /* ---------- 番茄钟（V2 FR8） ---------- */
@@ -407,7 +520,8 @@ createApp({
           if (this.currentId === dirId) await this.loadRecentLogs();
           this.toast(`🍅 专注 ${focusMinutes} 分钟完成，已记入学习日志，休息一下吧`);
         } catch (_) {
-          this.toast("🍅 专注完成，但日志记录失败（目标方向可能已删除）");
+          // 失败的具体原因 this.api 已 toast（如：目标方向已删除、时长非整数）
+          this.toast("🍅 专注完成，但日志记录失败");
         }
         this.pomodoro.mode = "break";
         this.pomodoro.remaining = POMO_BREAK;
@@ -446,12 +560,15 @@ createApp({
         return; // 失败原因 this.api 已经 toast 过，这里只负责不再抛未捕获的 rejection
       }
       await this.loadDirections();
-      // 导入是整库替换，原先停用的详情/统计视图 id 可能已不存在，一并复位
+      // 导入是整库替换，原先停用的详情/统计/复习视图 id 可能已不存在，一并复位
       this.currentId = null;
       this.currentDirection = null;
       this.detail = { direction: null, phases: [] };
       this.stats = null;
       this.review = null;
+      this.reviewQueue = [];
+      this.reviewCounts = null;
+      this.cards = [];
       this.view = "home";
       this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },

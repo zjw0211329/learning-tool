@@ -49,9 +49,34 @@ CREATE TABLE IF NOT EXISTS logs (
     created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
+-- V3（FR9）：复习卡两张新表。迁移策略 additive-only —— 全部
+-- CREATE TABLE IF NOT EXISTS，老库下次启动自动补建，无 ALTER、无停机。
+-- cards.fsrs 是唯一事实源（官方 Card.to_dict() 的 JSON），due 只是为队列
+-- 查询冗余的排序列，两列都只经 app/review.py 的写入口赋值。
+CREATE TABLE IF NOT EXISTS cards (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction_id INTEGER NOT NULL REFERENCES directions(id) ON DELETE CASCADE,
+    front        TEXT NOT NULL,
+    back         TEXT NOT NULL DEFAULT '',
+    fsrs         TEXT NOT NULL,
+    due          TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+-- 该表唯一时间列是 reviewed_at（UTC ISO 8601）；刻意不设 created_at，
+-- 避免同一张表里混着两种时区口径的列（docs/06 §3 决议）。
+CREATE TABLE IF NOT EXISTS review_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id     INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    rating      INTEGER NOT NULL CHECK (rating IN (1, 2, 3, 4)),
+    reviewed_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_logs_dir_date ON logs(direction_id, date);
 CREATE INDEX IF NOT EXISTS idx_tasks_phase   ON tasks(phase_id);
 CREATE INDEX IF NOT EXISTS idx_phases_dir    ON phases(direction_id);
+CREATE INDEX IF NOT EXISTS idx_cards_dir_due      ON cards(direction_id, due);
+CREATE INDEX IF NOT EXISTS idx_review_logs_card   ON review_logs(card_id, reviewed_at);
 """
 
 

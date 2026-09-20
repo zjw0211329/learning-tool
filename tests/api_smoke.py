@@ -17,7 +17,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.join(os.path.dirname(HERE), "app")
@@ -177,6 +177,10 @@ s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": 0, "content": "  
 check("时长与内容皆空 → 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": -1, "content": "x"})
 check("负时长 → 400", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": 25.5, "content": "x"})
+check("浮点时长 → 400（不再被 int() 静默截断，Qoder TD1 附注）", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": True, "content": "x"})
+check("布尔时长 → 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"date": "2026-9-1", "minutes": 5})
 check("非法日期格式 → 400", s == 400, s)
 s, _ = call("POST", "/api/directions/999999/logs", {"minutes": 5})
@@ -184,6 +188,8 @@ check("不存在方向的日志 → 404", s == 404, s)
 s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"minutes": 90})
 _, logs = get(f"/api/directions/{did}/logs")
 check("编辑日志时长生效", s == 200 and logs[0]["minutes"] == 90, logs[:1])
+s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"minutes": 30.5})
+check("编辑为浮点时长 → 400", s == 400, s)
 
 # 统计与回顾（先制造一条 skipped，用于校验 total 字段口径）
 call("PATCH", f"/api/tasks/{t2['id']}", {"status": "skipped"})
@@ -250,6 +256,24 @@ if _client is not None:
     check("示例：≥15 任务", demo["total"] >= 15, demo["total"])
     check("示例：≥20 天日志", len({l["date"] for l in lg}) >= 20, len(lg))
     check("示例：进度在 0~100 之间", 0 <= demo["progress"] <= 100, demo["progress"])
+
+    # V3（FR9.7）：示例复习卡 —— 到期时间动态生成，禁止写死日期
+    _, cards5 = get(f"/api/directions/{demo['id']}/cards")
+    check("示例：6 张复习卡", len(cards5) == 6, len(cards5))
+    s, q5 = get(f"/api/directions/{demo['id']}/review/queue")
+    check("示例：队列 = 4 张到期卡 + 2 张新卡",
+          s == 200 and q5["counts"]["due"] == 4 and q5["counts"]["new"] == 2
+          and q5["counts"]["total"] == 6 and len(q5["queue"]) == 6, q5.get("counts"))
+    now5 = datetime.now(timezone.utc).isoformat()
+    fresh5 = [c for c in cards5 if c["fsrs"]["last_review"] is None]
+    overdue5 = [c for c in cards5 if c["fsrs"]["last_review"] is not None]
+    check("示例：2 张新卡，due = 创建时刻（今天）",
+          len(fresh5) == 2 and all(c["due"][:10] == now5[:10] for c in fresh5),
+          [c["due"] for c in fresh5])
+    check("示例：4 张到期卡，due 已过期且 30 天前复习过",
+          len(overdue5) == 4 and all(c["due"] < now5 for c in overdue5)
+          and all(c["fsrs"]["last_review"] < now5[:10] + "T" for c in overdue5),
+          [c["due"] for c in overdue5])
 else:
     print("SKIP  真实服务模式跳过（避免污染/依赖空库）")
 
@@ -322,9 +346,10 @@ if _client is not None:
     _, dirs_before = get("/api/directions")
     s, backup = get("/api/export")
     check("导出：元信息完整",
-          s == 200 and backup["app"] == "study-tools" and backup["version"] == 1
+          s == 200 and backup["app"] == "study-tools" and backup["version"] == 2
           and isinstance(backup.get("exported_at"), str), backup.get("app"))
-    counts = {k: len(backup[k]) for k in ("directions", "phases", "tasks", "logs")}
+    counts = {k: len(backup[k]) for k in
+              ("directions", "phases", "tasks", "logs", "cards", "review_logs")}
     check("导出：数量与现库一致",
           counts["directions"] == len(dirs_before), (counts, len(dirs_before)))
 
@@ -458,20 +483,358 @@ if _client is not None:
     check("导入后新建方向 id > 备份最大 id（AUTOINCREMENT 自推进）",
           s == 201 and fresh["id"] > max_backup_dir, (fresh["id"], max_backup_dir))
     call("DELETE", f"/api/directions/{fresh['id']}")
+
+    # ---- V3：备份版本兼容矩阵（docs/06 §5，§9.4 验收）----
+    # v3 库 × v1 备份：v1（V3 之前）没有 cards/review_logs 键 → 按空表放行
+    v1_shape = {k: backup[k] for k in
+                ("app", "exported_at", "directions", "phases", "tasks", "logs")}
+    v1_shape["version"] = 1
+    s, res = call("POST", "/api/import", v1_shape)
+    check("v3 库 × v1 备份 → 200，cards/review_logs 按空表",
+          s == 200 and res["counts"]["cards"] == 0 and res["counts"]["review_logs"] == 0, res)
+    _, cards_v1 = get(f"/api/directions/{v1_shape['directions'][0]['id']}/cards")
+    check("v1 导入后卡片被清空（整库替换语义）", cards_v1 == [], len(cards_v1))
+
+    # v3 库 × v2 备份：往返一致
+    s, res = call("POST", "/api/import", backup)
+    check("v3 库 × v2 备份 → 200 且卡片/复习记录计数一致",
+          s == 200 and res["counts"]["cards"] == counts["cards"]
+          and res["counts"]["review_logs"] == counts["review_logs"], res)
+    _, cards_rt = get(f"/api/directions/{backup['directions'][0]['id']}/cards")
+    check("v2 备份往返：卡片正反面/due/调度状态逐字段还原",
+          {c["id"]: (c["front"], c["back"], c["due"], c["fsrs"]) for c in cards_rt}
+          == {c["id"]: (c["front"], c["back"], c["due"], c["fsrs"]) for c in backup["cards"]},
+          len(cards_rt))
+
+    # 版本高于本程序支持 → 文案明说（不再笼统报"不是有效的备份"）
+    hi = json.loads(json.dumps(backup)); hi["version"] = 99
+    s, res = call("POST", "/api/import", hi)
+    check("备份版本 99 → 400 且文案明说高于本程序支持的 2",
+          s == 400 and "高于本程序支持的 2" in res["error"], res)
+
+    # v2 备份必须带两张新表
+    no_cards = json.loads(json.dumps(backup)); no_cards.pop("cards")
+    s, _ = call("POST", "/api/import", no_cards)
+    check("v2 备份缺 cards 键 → 400", s == 400, s)
+
+    # cards / review_logs 字段与跨表一致性探针（对抗性，同上方风格）
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0]["fsrs"].__setitem__("card_id", 999999)))
+    check("调度状态与卡片 id 不一致 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0]["fsrs"].__setitem__("due", "2099-01-01T00:00:00+00:00")))
+    check("调度状态与 due 列不一致 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0].__setitem__("due", "2026-09-19T12:00:00+08:00")))
+    check("due 非 UTC 时区 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0].__setitem__("fsrs", {"card_id": 1, "state": 1})))
+    check("调度状态缺字段 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0].__setitem__("fsrs", "not-a-dict")))
+    check("调度状态非对象 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0].pop("front")))
+    check("卡片缺正面 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["cards"][0].__setitem__("direction_id", 999999)))
+    check("卡片指向不存在方向 → 400", s == 400, s)
+    if backup["review_logs"]:
+        s, _ = call("POST", "/api/import", _mutate(
+            lambda b: b["review_logs"][0].__setitem__("rating", 5)))
+        check("复习记录评分越界 → 400", s == 400, s)
+        s, _ = call("POST", "/api/import", _mutate(
+            lambda b: b["review_logs"][0].__setitem__("card_id", 999999)))
+        check("复习记录指向不存在卡片 → 400", s == 400, s)
+        s, _ = call("POST", "/api/import", _mutate(
+            lambda b: b["review_logs"][0].__setitem__("reviewed_at", "2026-09-19 12:00:00")))
+        check("复习时间非 ISO 格式 → 400", s == 400, s)
+    call("POST", "/api/import", backup)  # 还原
+    _, dirs_ok3 = get("/api/directions")
+    check("兼容矩阵探针均未破坏现库", len(dirs_ok3) == counts["directions"], len(dirs_ok3))
 else:
     print("SKIP  真实服务模式跳过（整库替换不应用于真实数据）")
 
 # ---------- 8. TD2 防回归：方向列表与详情口径逐字段一致 ----------
 
 print("\n[8] 列表与详情口径一致（TD2 防回归）")
+# Qoder 轮审补充：此前该步只有 demo 一个方向（8 字段 × 1 方向，覆盖面薄）。
+# 显式构造边界方向 —— 空方向 / 全部任务 skipped（分母为 0 边界）/
+# 只有零时长日志（active_days/streak 口径 + 同日多条零时长日志）——
+# 让分母边界与口径真的被跨接口（列表 × roadmap × stats）比对过。
+s, bd_empty = call("POST", "/api/directions", {"name": QA_DIR, "description": "边界：空方向"})
+s, bd_skip = call("POST", "/api/directions", {"name": QA_DIR, "description": "边界：全 skipped"})
+_, ph_b = call("POST", f"/api/directions/{bd_skip['id']}/phases", {"name": "唯一阶段"})
+for i in (1, 2):
+    _, tk_b = call("POST", f"/api/phases/{ph_b['id']}/tasks", {"title": f"跳过{i}"})
+    call("PATCH", f"/api/tasks/{tk_b['id']}", {"status": "skipped"})
+s, bd_note = call("POST", "/api/directions", {"name": QA_DIR, "description": "边界：有内容无时长"})
+call("POST", f"/api/directions/{bd_note['id']}/logs", {"minutes": 0, "content": "纯笔记一条"})
+call("POST", f"/api/directions/{bd_note['id']}/logs", {"minutes": 0, "content": "纯笔记二条"})
+
 _, dirs8 = get("/api/directions")
-check("存在可对比的方向", len(dirs8) > 0, len(dirs8))
+check("存在可对比的方向（含 3 个边界方向）", len(dirs8) >= 4, len(dirs8))
 for d in dirs8:
     _, rm8 = get(f"/api/directions/{d['id']}/roadmap")
     dd = rm8["direction"]
     for k in ("total", "done", "doing", "skipped", "progress",
               "total_minutes", "active_days", "streak"):
         check(f"方向{d['id']} 列表.{k} == 详情.{k}", d[k] == dd[k], (d[k], dd[k]))
+    _, st8 = get(f"/api/directions/{d['id']}/stats")
+    for k in ("total", "done", "doing", "skipped", "progress"):
+        check(f"方向{d['id']} 列表.{k} == stats.tasks.{k}", d[k] == st8["tasks"][k], (d[k], st8["tasks"][k]))
+    for k in ("total_minutes", "active_days", "streak"):
+        check(f"方向{d['id']} 列表.{k} == stats.{k}", d[k] == st8[k], (d[k], st8[k]))
+
+# 边界口径抽查（Qoder 边界数据集）
+one_skip = status_of(bd_skip["id"])
+check("边界：全 skipped 方向 total=0 且 progress=0（分母边界）",
+      one_skip["total"] == 0 and one_skip["progress"] == 0 and one_skip["skipped"] == 2, one_skip)
+one_note = status_of(bd_note["id"])
+check("边界：同日多条零时长日志 → active_days=1 / streak=1 / total_minutes=0",
+      one_note["active_days"] == 1 and one_note["streak"] == 1
+      and one_note["total_minutes"] == 0, one_note)
+
+for d in (bd_empty, bd_skip, bd_note):
+    call("DELETE", f"/api/directions/{d['id']}")
+
+# ---------- 9. 复习卡片（V3 FR9） ----------
+
+print("\n[9] 复习卡片（V3）")
+import review as review_mod
+
+# 9.1 调度器基准（docs/06 §4/§9.1；不碰 DB，两种模式都跑）。
+# 断言值为本机 fsrs==6.3.2 实测基线 —— 显式传 review_datetime，无参 Card() 的
+# due 是「现在」，不传会随运行时间漂移。
+T0 = datetime(2026, 9, 19, 12, 0, 0, tzinfo=timezone.utc)
+c = review_mod.new_card(1)
+check("新卡：card_id 显式对齐、初始为 Learning 态",
+      c.card_id == 1 and c.state.value == 1 and c.last_review is None, c.to_dict())
+c1, _ = review_mod.review(c, 3, when=T0)
+d1 = c1.to_dict()
+check("Good 基线：state=1/step=1/stability=2.3065/difficulty≈2.1181/due=+10 分钟",
+      d1["state"] == 1 and d1["step"] == 1 and d1["stability"] == 2.3065
+      and round(d1["difficulty"], 4) == 2.1181
+      and d1["due"] == "2026-09-19T12:10:00+00:00", d1)
+c2, _ = review_mod.review(c1, 3, when=T0)
+check("再 Good → Review 态，due=+2 天",
+      c2.state.value == 2 and c2.due.isoformat() == "2026-09-21T12:00:00+00:00", c2.due)
+c3, _ = review_mod.review(c2, 1, when=T0)
+check("再 Again → Relearning，due=+10 分钟（stability≈0.7751，docs/06 原值 0.608 有误）",
+      c3.state.value == 3 and c3.due.isoformat() == "2026-09-19T12:10:00+00:00"
+      and round(c3.stability, 4) == 0.7751, (c3.state, c3.due, c3.stability))
+check("fsrs 列序列化往返一致（card_to_json ↔ card_from_json）",
+      review_mod.card_from_json(review_mod.card_to_json(c3)).to_dict() == c3.to_dict())
+ra, _ = review_mod.review(review_mod.new_card(7), 3, when=T0)
+rb, _ = review_mod.review(review_mod.new_card(7), 3, when=T0)
+check("enable_fuzzing=False：同输入两次调度结果完全相等", ra.to_dict() == rb.to_dict())
+try:
+    review_mod.review(review_mod.new_card(8), 3, when=datetime(2026, 9, 19, 12))
+    naive_rejected = False
+except ValueError:
+    naive_rejected = True
+check("naive datetime 被拒绝（必须 tz-aware UTC）", naive_rejected)
+
+# 间隔单调性：先两次 Good 推进 Review 态，此后每次恰好在到期时刻复习，间隔单调不减
+cm = review_mod.new_card(9)
+cm, _ = review_mod.review(cm, 3, when=T0)
+cm, _ = review_mod.review(cm, 3, when=T0)
+gaps = []
+for _ in range(5):
+    when = cm.due
+    cm, _ = review_mod.review(cm, 3, when=when)
+    gaps.append((cm.due - when).days)
+check("Review 态后连续 Good：due 间隔单调不减", all(a <= b for a, b in zip(gaps, gaps[1:])), gaps)
+
+# 9.2 卡片 API 全链路（QA 方向内，两种模式都跑，结束清理）
+s, d9 = call("POST", "/api/directions", {"name": QA_DIR, "description": "V3 复习测试"})
+check("复习临时方向 → 201", s == 201, s)
+d9id = d9["id"]
+s, _ = call("POST", f"/api/directions/{d9id}/cards", {"front": "   "})
+check("空正面建卡 → 400", s == 400, s)
+made = []
+for i in range(12):
+    _, card = call("POST", f"/api/directions/{d9id}/cards", {"front": f"卡{i}", "back": f"答{i}"})
+    made.append(card)
+check("建 12 张卡 → fsrs.card_id 与表 id 对齐（docs/06 §3 决议）",
+      all(c["fsrs"]["card_id"] == c["id"] for c in made), [c["fsrs"]["card_id"] for c in made[:3]])
+s, cards9 = get(f"/api/directions/{d9id}/cards")
+check("卡片列表 → 12 张且均为未复习新卡（state=1 / last_review 空）",
+      len(cards9) == 12 and all(c["state"] == 1 and c["fsrs"]["last_review"] is None for c in cards9),
+      len(cards9))
+s, q9 = get(f"/api/directions/{d9id}/review/queue")
+check("队列：12 张新卡截到每日上限 10（§9.2）",
+      s == 200 and len(q9["queue"]) == 10 and q9["counts"]["new"] == 10
+      and q9["counts"]["due"] == 0 and q9["counts"]["total"] == 12
+      and q9["counts"]["done_today"] == 0, q9.get("counts"))
+_, dirs9 = get("/api/directions")
+check("列表徽标：新卡（due=创建时刻）不计入「今日待复习」",
+      next(d for d in dirs9 if d["id"] == d9id)["due_today"] == 0,
+      [d.get("due_today") for d in dirs9])
+
+for bad in (0, 5, "3", True, None, 2.5):
+    s, _ = call("POST", f"/api/cards/{made[0]['id']}/review", {"rating": bad})
+    check(f"非法 rating {bad!r} → 400", s == 400, s)
+s, _ = call("POST", "/api/cards/999999/review", {"rating": 3})
+check("复习不存在的卡 → 404", s == 404, s)
+s, _ = get("/api/directions/999999/cards")
+check("不存在方向的卡片列表 → 404", s == 404, s)
+s, _ = get("/api/directions/999999/review/queue")
+check("不存在方向的队列 → 404", s == 404, s)
+
+# 评分：Good → Learning（due +10 分钟）；再 Good → Review（due +2 天）；
+# 两者 due 都在未来 → 移出当日队列、不出现在今日队列
+s, r9 = call("POST", f"/api/cards/{made[0]['id']}/review", {"rating": 3})
+check("评分 Good → 200，落 last_review 且 due 晚于现在",
+      s == 200 and r9["state"] == 1 and r9["fsrs"]["last_review"] is not None
+      and r9["due"] > datetime.now(timezone.utc).isoformat(), r9.get("due"))
+_, q9b = get(f"/api/directions/{d9id}/review/queue")
+check("评分后该卡移出当日队列（§9.2）",
+      all(c["id"] != made[0]["id"] for c in q9b["queue"]), len(q9b["queue"]))
+check("队列计数：done_today=1，新卡配额被当日消耗（10-1=9）",
+      q9b["counts"]["done_today"] == 1 and q9b["counts"]["new"] == 9
+      and len(q9b["queue"]) == 9, q9b["counts"])
+s, r9b = call("POST", f"/api/cards/{made[0]['id']}/review", {"rating": 3})
+check("再 Good → Review 态（明日之后到期）", s == 200 and r9b["state"] == 2, r9b.get("state"))
+_, q9c = get(f"/api/directions/{d9id}/review/queue")
+check("明日到期卡不出现在今日队列（§9.2）",
+      all(c["id"] != made[0]["id"] for c in q9c["queue"]), len(q9c["queue"]))
+_, bk9 = get("/api/export")
+logs9 = [r for r in bk9["review_logs"] if r["card_id"] == made[0]["id"]]
+check("评分落 review_logs（2 条、评分=3、UTC ISO）",
+      len(logs9) == 2 and all(r["rating"] == 3 for r in logs9)
+      and all(r["reviewed_at"].endswith("+00:00") for r in logs9), len(logs9))
+
+# 编辑 / 删除 / 级联
+s, e9 = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": "改过的正面", "back": "新背面"})
+check("编辑卡片 → 200", s == 200 and e9["front"] == "改过的正面" and e9["back"] == "新背面", e9)
+s, _ = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": "  "})
+check("编辑为空正面 → 400", s == 400, s)
+s, _ = call("PATCH", "/api/cards/999999", {"front": "x"})
+check("编辑不存在的卡 → 404", s == 404, s)
+s, _ = call("DELETE", f"/api/cards/{made[1]['id']}")
+check("删除卡片 → 200", s == 200, s)
+_, cards9b = get(f"/api/directions/{d9id}/cards")
+check("删除后卡片列表 11 张", len(cards9b) == 11, len(cards9b))
+s, _ = call("DELETE", f"/api/cards/{made[1]['id']}")
+check("重复删除 → 404", s == 404, s)
+call("DELETE", f"/api/cards/{made[0]['id']}")
+_, bk9b = get("/api/export")
+check("删卡后其 review_logs 级联清除",
+      all(r["card_id"] != made[0]["id"] for r in bk9b["review_logs"]), len(bk9b["review_logs"]))
+call("DELETE", f"/api/directions/{d9id}")
+
+# 9.3 / 9.4 仅临时库模式：
+# 队列到期语义需要「已过期的复习态卡」—— API 只能向前调度，用显式过去时间
+# 驱动 fsrs 后直写库（模拟时间流逝）；迁移测试则建独立的老库文件。
+if _client is not None:
+    import sqlite3
+
+    s, d9c = call("POST", "/api/directions", {"name": QA_DIR, "description": "队列边界"})
+    d9cid = d9c["id"]
+    conn = sqlite3.connect(database.DB_PATH)
+    cur9 = conn.execute(
+        "INSERT INTO cards(direction_id, front, back, fsrs, due) VALUES (?, ?, ?, '', '')",
+        (d9cid, "过期卡", "背面"))
+    card = review_mod.new_card(cur9.lastrowid)
+    past = datetime.now(timezone.utc) - timedelta(days=30)
+    card, _ = review_mod.review(card, 3, when=past)
+    card, _ = review_mod.review(card, 3, when=past)
+    conn.execute("UPDATE cards SET fsrs = ?, due = ? WHERE id = ?",
+                 (review_mod.card_to_json(card), review_mod.due_of(card), cur9.lastrowid))
+    conn.commit()
+    conn.close()
+    call("POST", f"/api/directions/{d9cid}/cards", {"front": "新卡一张", "back": ""})
+    s, q9d = get(f"/api/directions/{d9cid}/review/queue")
+    check("过期 Review 卡计入 due 且排队列最前（到期优先）",
+          s == 200 and q9d["counts"]["due"] == 1 and q9d["queue"][0]["front"] == "过期卡",
+          q9d.get("counts"))
+    check("新卡排在到期卡之后",
+          len(q9d["queue"]) == 2 and q9d["queue"][1]["front"] == "新卡一张",
+          [c["front"] for c in q9d["queue"]])
+    _, dirs9d = get("/api/directions")
+    check("列表徽标：过期卡计入「今日待复习」",
+          next(d for d in dirs9d if d["id"] == d9cid)["due_today"] == 1,
+          [d.get("due_today") for d in dirs9d])
+    call("DELETE", f"/api/directions/{d9cid}")
+
+    # 9.4 自包含迁移测试（§9.3）：内联 v2.0 四表 SCHEMA —— 建库 → 塞旧数据 →
+    # 当前 init_db() → 断言新表出现且旧数据完整。不依赖 git 历史文件。
+    V2_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS directions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE TABLE IF NOT EXISTS phases (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        direction_id INTEGER NOT NULL REFERENCES directions(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        goal         TEXT NOT NULL DEFAULT '',
+        sort_order   INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE TABLE IF NOT EXISTS tasks (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        phase_id   INTEGER NOT NULL REFERENCES phases(id) ON DELETE CASCADE,
+        title      TEXT NOT NULL,
+        note       TEXT NOT NULL DEFAULT '',
+        status     TEXT NOT NULL DEFAULT 'todo'
+                   CHECK (status IN ('todo', 'doing', 'done', 'skipped')),
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+        done_at    TEXT
+    );
+    CREATE TABLE IF NOT EXISTS logs (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        direction_id INTEGER NOT NULL REFERENCES directions(id) ON DELETE CASCADE,
+        date         TEXT NOT NULL,
+        minutes      INTEGER NOT NULL DEFAULT 0,
+        content      TEXT NOT NULL DEFAULT '',
+        created_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_logs_dir_date ON logs(direction_id, date);
+    CREATE INDEX IF NOT EXISTS idx_tasks_phase   ON tasks(phase_id);
+    CREATE INDEX IF NOT EXISTS idx_phases_dir    ON phases(direction_id);
+    """
+    mig = tempfile.mkdtemp(prefix="study_tools_mig_")
+    old_path = os.path.join(mig, "v2.db")
+    conn = sqlite3.connect(old_path)
+    conn.executescript(V2_SCHEMA)
+    conn.execute("INSERT INTO directions(id, name, description) VALUES (1, '旧方向', 'v2 库')")
+    conn.execute("INSERT INTO phases(id, direction_id, name, goal, sort_order) VALUES (1, 1, '旧阶段', '', 0)")
+    conn.execute("INSERT INTO tasks(id, phase_id, title, status, sort_order, done_at) "
+                 "VALUES (1, 1, '旧任务', 'done', 0, '2026-01-01')")
+    conn.execute("INSERT INTO logs(id, direction_id, date, minutes, content) VALUES (1, 1, '2026-01-02', 30, '旧日志')")
+    conn.execute("INSERT INTO logs(id, direction_id, date, minutes, content) VALUES (2, 1, '2026-01-02', 0, '零时长旧日志')")
+    conn.commit()
+    conn.close()
+
+    saved_path, saved_dir = database.DB_PATH, database.DATA_DIR
+    database.DB_PATH, database.DATA_DIR = old_path, mig
+    database.init_db()   # 当前 SCHEMA 全 IF NOT EXISTS：v2 老库只补两张新表
+    database.init_db()   # 幂等：模拟程序反复启动
+    conn = sqlite3.connect(old_path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    check("迁移：cards / review_logs 被补建（additive-only）",
+          {"cards", "review_logs"} <= tables, sorted(tables))
+    idxs = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    check("迁移：两张新索引被补建",
+          {"idx_cards_dir_due", "idx_review_logs_card"} <= idxs, sorted(idxs))
+    old_counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("directions", "phases", "tasks", "logs")}
+    check("迁移：旧数据原样保留（1/1/1/2）",
+          old_counts == {"directions": 1, "phases": 1, "tasks": 1, "logs": 2}, old_counts)
+    row = conn.execute("SELECT title, status, done_at FROM tasks WHERE id = 1").fetchone()
+    check("迁移：旧数据内容可查", row == ("旧任务", "done", "2026-01-01"), row)
+    conn.close()
+    database.DB_PATH, database.DATA_DIR = saved_path, saved_dir
+    shutil.rmtree(mig, ignore_errors=True)
+    s, _ = get("/api/directions")
+    check("迁移测试未影响主测试库（DB_PATH 已复原）", s == 200, s)
+else:
+    print("SKIP  真实服务模式跳过 9.3/9.4（直写库与迁移仅临时库模式）")
 
 # ---------- 汇总 ----------
 
