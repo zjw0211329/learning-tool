@@ -106,11 +106,17 @@
         <div class="roadmap">
           <div class="phase-card card" v-for="p in detail.phases" :key="p.id">
             <div class="phase-head">
-              <div class="phase-title">
-                <h3>{{ p.name }}</h3>
-                <p class="muted small" v-if="p.goal">🎯 {{ p.goal }}</p>
+              <div class="phase-left">
+                <button class="icon-btn fold-btn"
+                        :title="isCollapsed(p) ? '展开阶段' : '折叠阶段'"
+                        @click="togglePhase(p)">{{ isCollapsed(p) ? '▸' : '▾' }}</button>
+                <div class="phase-title">
+                  <h3>{{ p.name }}</h3>
+                  <p class="muted small" v-if="p.goal">🎯 {{ p.goal }}</p>
+                </div>
               </div>
               <div class="phase-actions">
+                <span class="muted small" v-if="isCollapsed(p)">任务 {{ p.done }}/{{ p.total }}</span>
                 <span class="pct small">{{ p.progress }}%</span>
                 <button class="icon-btn" title="上移阶段" @click="reorderPhase(p, 'up')">↑</button>
                 <button class="icon-btn" title="下移阶段" @click="reorderPhase(p, 'down')">↓</button>
@@ -120,7 +126,7 @@
             </div>
             <div class="progress-track"><div class="progress-fill" :style="{width: p.progress + '%'}"></div></div>
 
-            <ul class="task-list">
+            <ul class="task-list" v-show="!isCollapsed(p)">
               <li v-for="t in p.tasks" :key="t.id" class="task" :class="'task-' + t.status">
                 <button class="status-dot" :class="'dot-' + t.status"
                         :title="statusLabel(t.status) + '（点击切换：未开始→进行中→已完成→跳过）'"
@@ -143,7 +149,7 @@
               <li v-if="p.tasks.length === 0" class="muted small" style="padding: 6px 2px">暂无任务</li>
             </ul>
 
-            <div class="form-row task-add">
+            <div class="form-row task-add" v-show="!isCollapsed(p)">
               <input v-model.trim="p._addTitle" placeholder="添加任务，回车确认"
                      @keyup.enter="addTask(p)">
               <button class="btn btn-sm" @click="addTask(p)">＋</button>

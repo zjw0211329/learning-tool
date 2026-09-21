@@ -111,8 +111,12 @@ body {
 .detail-layout { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
 .roadmap { min-width: 0; }
 .phase-head { display: flex; justify-content: space-between; gap: 8px; }
+.phase-left { display: flex; align-items: flex-start; gap: 2px; min-width: 0; }
 .phase-title h3 { font-size: 16px; }
 .phase-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+/* 折叠开关（V4 FR10）：中性 hover，不继承 icon-btn 的删除红 */
+.fold-btn { font-size: 13px; line-height: 22px; }
+.fold-btn:hover { background: #eef2ff; color: var(--primary); }
 .task-list { list-style: none; margin-top: 4px; }
 .task {
   display: flex; align-items: center; gap: 10px; padding: 7px 2px;

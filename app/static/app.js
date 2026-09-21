@@ -40,6 +40,17 @@ function fmtDue(iso) {
 
 const STATUS_LABELS = { todo: "未开始", doing: "进行中", done: "已完成", skipped: "已跳过" };
 
+const COLLAPSED_KEY = "st_collapsed_phases";
+
+function loadCollapsedPhases() {
+  try {
+    const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY));
+    return v && typeof v === "object" ? v : {};
+  } catch (_) {
+    return {};
+  }
+}
+
 // fsrs v6 状态值：1 学习中 / 2 复习中 / 3 重学中（没有 New 态，新卡看 last_review）
 const CARD_STATE_LABELS = { 1: "学习中", 2: "复习中", 3: "重学中" };
 
@@ -66,6 +77,10 @@ const app = createApp({
       recentLogs: [],
       newPhase: { name: "", goal: "" },
       newLog: { date: todayStr(), minutes: null, content: "" },
+
+      // 阶段折叠（V4 FR10）：roadmap 每次全量重建，状态必须独立于 phase 对象生命周期；
+      // localStorage 记忆跨会话，损坏 JSON 一律回退为全部展开（不弹错）
+      collapsedPhases: loadCollapsedPhases(),
 
       stats: null,
       review: null,
@@ -256,6 +271,17 @@ const app = createApp({
       await this.loadRoadmap();
     },
 
+    // 阶段折叠（V4 FR10）：响应式副本 + localStorage 双写；展开为默认态
+    isCollapsed(p) {
+      return !!this.collapsedPhases[p.id];
+    },
+
+    togglePhase(p) {
+      if (this.collapsedPhases[p.id]) delete this.collapsedPhases[p.id];
+      else this.collapsedPhases[p.id] = true;
+      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(this.collapsedPhases));
+    },
+
     async addTask(p) {
       if (!p._addTitle) { this.toast("请先填写任务标题"); return; }
       await this.api(`/api/phases/${p.id}/tasks`, { method: "POST", body: { title: p._addTitle } });
@@ -367,7 +393,8 @@ const app = createApp({
         const maxMin = Math.max(60, ...this.stats.heatmap.map((x) => x.minutes));
         window.__heatmap.setOption({
           tooltip: {
-            formatter: (p) => `${p.value[0]}<br>学习 ${p.value[1] || 0} 分钟`,
+            // 时长统一人性化口径（V4 FR11）：原始分钟 → 「X 小时 Y 分」
+            formatter: (p) => `${p.value[0]}<br>学习 ${fmtMinutes(p.value[1] || 0)}`,
           },
           visualMap: {
             min: 0, max: maxMin, show: false,
@@ -398,18 +425,27 @@ const app = createApp({
           if (window.__weekly) window.__weekly.dispose();
           window.__weekly = echarts.init(weekEl);
         }
+        // 周时长条形图（V4 FR11）：统一小时口径——柱高/Y 轴用小时（1 位小数），
+        // 但 tooltip 必须从原始分钟取值：小时值经过 toFixed(1) 舍入，反推分钟
+        // 会失真（20 分钟 → 0.3h → 显示 18 分钟），视觉近似、标注必须精确
         window.__weekly.setOption({
           grid: { left: 44, right: 12, top: 16, bottom: 26 },
-          tooltip: { trigger: "axis" },
+          tooltip: {
+            trigger: "axis",
+            formatter: (ps) => {
+              const w = this.stats.weekly[ps[0].dataIndex];
+              return `${ps[0].name}<br>${fmtMinutes(w ? w.minutes : 0)}`;
+            },
+          },
           xAxis: {
             type: "category",
             data: this.stats.weekly.map((w) => w.week_start.slice(5)),
           },
-          yAxis: { type: "value", name: "分钟" },
+          yAxis: { type: "value", name: "小时" },
           series: [{
             type: "bar", barMaxWidth: 26,
             itemStyle: { color: "#6366f1", borderRadius: [4, 4, 0, 0] },
-            data: this.stats.weekly.map((w) => w.minutes),
+            data: this.stats.weekly.map((w) => +(w.minutes / 60).toFixed(1)),
           }],
         });
       }
