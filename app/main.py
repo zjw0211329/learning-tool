@@ -27,6 +27,10 @@ app.teardown_appcontext(close_db)
 
 TASK_STATUSES = ("todo", "doing", "done", "skipped")
 
+# 服务端口唯一出处（app.run 与自动开页共用——写在两处就会漏改，
+# docs/05 §3.6「共享状态的入口对称性」）
+PORT = 5000
+
 # 备份文件的元信息标识（import 时用于校验）。
 # v2：新增 cards / review_logs 两表（V3 FR9）；v1 备份仍可导入（兼容矩阵见 docs/06 §5）
 BACKUP_APP_ID = "study-tools"
@@ -1268,12 +1272,32 @@ def import_data():
 # ---------- 启动 ----------
 
 if __name__ == "__main__":
+    import socket
+    import sys
     import threading
     import webbrowser
+
+    # Windows 上 Werkzeug 的 allow_reuse_address 是堆叠绑定而非报错——双击两次
+    # 图标会悄悄叠出第二个服务（实测复现）。改为启动前探测：已在运行就直接
+    # 打开页面退出，既不叠服务，也把「再点一次图标」变成「帮我把页面叫出来」。
+    _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _probe.settimeout(0.5)
+    try:
+        _already = _probe.connect_ex(("127.0.0.1", PORT)) == 0
+    finally:
+        _probe.close()
+    if _already:
+        print(f"study tools 已在运行（http://127.0.0.1:{PORT}），直接打开页面。")
+        webbrowser.open(f"http://127.0.0.1:{PORT}")
+        sys.exit(0)
 
     init_db()
     # 桌面应用体验：服务起来后自动打开浏览器（run.bat / 桌面图标路径）。
     # 延迟 1.2 秒等端口就绪；门禁经 import 方式跑，不触发 __main__，不受影响。
-    threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
+    # daemon=True：启动即崩（缺依赖等）时进程随主线程立刻退出，不弹死链标签
+    _open_browser = threading.Timer(
+        1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}"))
+    _open_browser.daemon = True
+    _open_browser.start()
     # debug=False：个人本地工具无需热重载，也避免调试模式带来的安全隐患
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=PORT, debug=False)

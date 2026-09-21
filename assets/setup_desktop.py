@@ -2,6 +2,9 @@
 
 用法：python assets/setup_desktop.py
 项目移动位置或换机器后重跑一次即可。仅 Windows；macOS/Linux 请用 run.sh。
+
+路径经环境变量传给 PowerShell（不做任何字符串插值）——项目路径含撇号
+（如用户名 O'Brien）或其它特殊字符时既不会解析失败，也不存在注入面。
 """
 import os
 import subprocess
@@ -9,9 +12,10 @@ import sys
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PS_TEMPLATE = r"""
+# $env:ST_PROJ 由 subprocess 的 env 注入，PowerShell 侧只读取、不拼接
+PS_SCRIPT = r"""
 $desktop = [Environment]::GetFolderPath('Desktop')
-$proj = '{proj}'
+$proj = $env:ST_PROJ
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut("$desktop\studytool.lnk")
 $lnk.TargetPath = "$proj\run.bat"
@@ -26,7 +30,9 @@ Write-Output "OK: $desktop\studytool.lnk"
 if sys.platform != "win32":
     sys.exit("此脚本仅用于 Windows（macOS/Linux 请用 run.sh）")
 
-ps = PS_TEMPLATE.format(proj=PROJ)
-r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+r = subprocess.run(
+    ["powershell", "-NoProfile", "-Command", PS_SCRIPT],
+    capture_output=True, text=True, encoding="utf-8", errors="replace",
+    env={**os.environ, "ST_PROJ": PROJ},
+)
 print((r.stdout or r.stderr or "").strip())

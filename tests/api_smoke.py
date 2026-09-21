@@ -281,12 +281,26 @@ check("run.sh 全行 LF（CRLF 会破坏 bash 与 shebang）",
       len(_sh) > 0 and b"\r\n" not in _sh and _sh.count(b"\n") > 0,
       f"CRLF {_sh.count(b'\r\n')} 处")
 
-# 桌面图标资源护栏：多尺寸 ICO 存在且结构有效（快捷方式 setup_desktop.py 依赖它）
+# 桌面图标资源护栏（Qoder 建议升级为深度断言）：逐帧 PNG 签名、偏移连续、
+# 文件尾对齐、尺寸互不重复——"六档多尺寸"从声明变成断言，重新生成时少档
+# 或结构损坏会被立刻抓住
 import struct
 _ico = open(os.path.join(os.path.dirname(HERE), "assets", "studytool.ico"), "rb").read()
-check("assets/studytool.ico 存在且为有效多帧 ICO",
-      _ico[:4] == b"\x00\x00\x01\x00" and struct.unpack_from("<H", _ico, 4)[0] >= 4,
-      f"{len(_ico)}B, {struct.unpack_from('<H', _ico, 4)[0]} 帧")
+_ico_frames = struct.unpack_from("<H", _ico, 4)[0]
+check("assets/studytool.ico 为有效多帧 ICO（≥4 档）",
+      _ico[:4] == b"\x00\x00\x01\x00" and _ico_frames >= 4,
+      f"{len(_ico)}B, {_ico_frames} 帧")
+_ok_frames, _seen_sizes, _off, _tail_ok = 0, set(), 6 + 16 * _ico_frames, True
+for _i in range(_ico_frames):
+    _w = _ico[6 + 16 * _i] or 256
+    _size, _data_off = struct.unpack_from("<II", _ico, 6 + 16 * _i + 8)
+    _is_png = _ico[_data_off:_data_off + 8] == b"\x89PNG\r\n\x1a\n"
+    _ok_frames += int(_is_png and _data_off == _off)
+    _seen_sizes.add(_w if _is_png else -_w)
+    _off = _data_off + _size
+check("ICO 每帧为 PNG 且偏移首尾连续", _ok_frames == _ico_frames, f"{_ok_frames}/{_ico_frames}")
+check("ICO 文件尾对齐且尺寸互不重复",
+      _off == len(_ico) and len(_seen_sizes) == _ico_frames, (_off, len(_ico)))
 
 # ---------- 5. 示例数据验收项（仅空库临时模式） ----------
 
