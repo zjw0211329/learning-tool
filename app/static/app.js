@@ -279,7 +279,12 @@ const app = createApp({
     togglePhase(p) {
       if (this.collapsedPhases[p.id]) delete this.collapsedPhases[p.id];
       else this.collapsedPhases[p.id] = true;
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(this.collapsedPhases));
+      try {
+        localStorage.setItem(COLLAPSED_KEY, JSON.stringify(this.collapsedPhases));
+      } catch (_) {
+        // 隐私模式/配额满：持久化失败降级为仅本次会话（内存状态已正确），
+        // 不让这里冒未捕获错误（Qoder nit）
+      }
     },
 
     async addTask(p) {
@@ -648,6 +653,10 @@ const app = createApp({
       this.reviewQueue = [];
       this.reviewCounts = null;
       this.cards = [];
+      // 折叠表按 phase id 索引，导入会重新分配全部 id，不复位就张冠李戴
+      // （Qoder 实测：折叠阶段 id 72 → 导入后 72 撞上另一阶段 → 莫名其妙处于折叠态）
+      this.collapsedPhases = {};
+      localStorage.removeItem(COLLAPSED_KEY);
       this.view = "home";
       this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },
