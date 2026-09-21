@@ -1,0 +1,40 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="900" y2="950" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FCFF"/>
+      <stop offset="1" stop-color="#EAF5F3"/>
+    </linearGradient>
+    <linearGradient id="book" x1="260" y1="340" x2="770" y2="760" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#DDF0FF"/>
+      <stop offset="1" stop-color="#BDE4DC"/>
+    </linearGradient>
+    <filter id="shadow" x="170" y="260" width="690" height="560" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#A5C5CE" flood-opacity="0.24"/>
+    </filter>
+  </defs>
+
+  <!-- Soft, light app-icon background -->
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg)"/>
+  <circle cx="810" cy="218" r="104" fill="#FFF6CF" opacity="0.82"/>
+  <circle cx="205" cy="810" r="96" fill="#E8F2FF" opacity="0.82"/>
+
+  <!-- Open book -->
+  <g filter="url(#shadow)">
+    <path d="M512 415C449 355 360 328 254 337C231 339 214 358 214 381V688C214 711 233 729 256 727C369 718 455 745 512 806V415Z" fill="url(#book)" stroke="#34546A" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M512 415C575 355 664 328 770 337C793 339 810 358 810 381V688C810 711 791 729 768 727C655 718 569 745 512 806V415Z" fill="url(#book)" stroke="#34546A" stroke-width="22" stroke-linejoin="round"/>
+    <path d="M512 414V803" stroke="#34546A" stroke-width="22" stroke-linecap="round"/>
+  </g>
+
+  <!-- Minimal page lines -->
+  <path d="M280 454C342 448 401 460 448 488" stroke="#77A9B5" stroke-width="18" stroke-linecap="round" opacity="0.72"/>
+  <path d="M278 522C337 518 393 529 438 552" stroke="#77A9B5" stroke-width="18" stroke-linecap="round" opacity="0.56"/>
+  <path d="M744 454C682 448 623 460 576 488" stroke="#77A9B5" stroke-width="18" stroke-linecap="round" opacity="0.72"/>
+  <path d="M746 522C687 518 631 529 586 552" stroke="#77A9B5" stroke-width="18" stroke-linecap="round" opacity="0.56"/>
+
+  <!-- Study / smart spark -->
+  <path d="M792 194L810 244L860 262L810 280L792 330L774 280L724 262L774 244L792 194Z" fill="#F4C95D" stroke="#34546A" stroke-width="16" stroke-linejoin="round"/>
+  <path d="M681 179L689 202L712 210L689 218L681 241L673 218L650 210L673 202L681 179Z" fill="#91C9C0"/>
+
+  <!-- Small grounding dot -->
+  <circle cx="512" cy="862" r="15" fill="#F4C95D"/>
+</svg>

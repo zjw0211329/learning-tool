@@ -1268,6 +1268,12 @@ def import_data():
 # ---------- 启动 ----------
 
 if __name__ == "__main__":
+    import threading
+    import webbrowser
+
     init_db()
+    # 桌面应用体验：服务起来后自动打开浏览器（run.bat / 桌面图标路径）。
+    # 延迟 1.2 秒等端口就绪；门禁经 import 方式跑，不触发 __main__，不受影响。
+    threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:5000")).start()
     # debug=False：个人本地工具无需热重载，也避免调试模式带来的安全隐患
     app.run(host="127.0.0.1", port=5000, debug=False)

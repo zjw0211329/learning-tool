@@ -281,6 +281,13 @@ check("run.sh 全行 LF（CRLF 会破坏 bash 与 shebang）",
       len(_sh) > 0 and b"\r\n" not in _sh and _sh.count(b"\n") > 0,
       f"CRLF {_sh.count(b'\r\n')} 处")
 
+# 桌面图标资源护栏：多尺寸 ICO 存在且结构有效（快捷方式 setup_desktop.py 依赖它）
+import struct
+_ico = open(os.path.join(os.path.dirname(HERE), "assets", "studytool.ico"), "rb").read()
+check("assets/studytool.ico 存在且为有效多帧 ICO",
+      _ico[:4] == b"\x00\x00\x01\x00" and struct.unpack_from("<H", _ico, 4)[0] >= 4,
+      f"{len(_ico)}B, {struct.unpack_from('<H', _ico, 4)[0]} 帧")
+
 # ---------- 5. 示例数据验收项（仅空库临时模式） ----------
 
 print("\n[5] 示例数据（《02》验收标准 1）")
