@@ -632,6 +632,12 @@ const app = createApp({
         this.toast("文件不是有效的 JSON");
         return;
       }
+      // JSON.parse 合法但非对象（null / 数字 / 字符串 / 数组）时，下面 data[k]
+      // 会抛 TypeError 让导入静默死掉——先挡掉（V4 用户审查 #6）
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        this.toast("文件不是有效的备份 JSON");
+        return;
+      }
       const n = (k) => Array.isArray(data[k]) ? data[k].length : 0;
       if (!confirm(
         `导入将【覆盖】当前全部数据，替换为备份中的内容：\n\n` +
@@ -656,7 +662,11 @@ const app = createApp({
       // 折叠表按 phase id 索引，导入会重新分配全部 id，不复位就张冠李戴
       // （Qoder 实测：折叠阶段 id 72 → 导入后 72 撞上另一阶段 → 莫名其妙处于折叠态）
       this.collapsedPhases = {};
-      localStorage.removeItem(COLLAPSED_KEY);
+      try {
+        localStorage.removeItem(COLLAPSED_KEY);
+      } catch (_) {
+        // 隐私模式极端场景：清除失败不影响内存态已复位（用户审查 #6 顺带项）
+      }
       this.view = "home";
       this.toast(`导入成功：方向 ${res.counts.directions} 个、日志 ${res.counts.logs} 条`);
     },

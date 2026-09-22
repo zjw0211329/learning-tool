@@ -4,10 +4,11 @@ Flask 入口 + 全部 API 路由。接口设计见 docs/03-概要设计.md 第 4
 启动：python app/main.py  （默认 http://127.0.0.1:5000）
 """
 import json
+import os
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
-from flask import Flask, g, jsonify, request, send_from_directory
+from flask import Flask, g, jsonify, request, send_file, send_from_directory
 
 from database import close_db, get_db, init_db
 from demo_data import insert_demo
@@ -171,6 +172,23 @@ def _day_start_utc_iso():
     return local_midnight.astimezone(timezone.utc).isoformat()
 
 
+def _introduced_new_today(db, direction_id):
+    """本方向「今日已引入的新卡数」：首条 review_logs 落在今天（本地日界）的卡数。
+
+    队列截断与评分接口强制共用同一函数（V4 用户审查 #5）——两处口径一旦漂移，
+    队列显示 10 张、评分却能复习第 11 张的缺口就会回来（共享状态入口对称性）。
+    """
+    return db.execute(
+        """SELECT COUNT(*) AS n FROM (
+               SELECT l.card_id, MIN(l.reviewed_at) AS first_at
+               FROM review_logs l JOIN cards c ON c.id = l.card_id
+               WHERE c.direction_id = ?
+               GROUP BY l.card_id)
+           WHERE first_at >= ?""",
+        (direction_id, _day_start_utc_iso()),
+    ).fetchone()["n"]
+
+
 def _parse_minutes(value):
     """时长必须是严格的非负整数（bool 除外），否则返回 None。
 
@@ -208,6 +226,16 @@ def _text_field(body, key, label, required=False):
 @app.get("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    """浏览器默认会请求 /favicon.ico（此前是 404）。图标单一事实源在 assets/。"""
+    return send_file(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", "assets", "studytool.ico"),
+        mimetype="image/x-icon",
+    )
 
 
 # ---------- 方向 ----------
@@ -298,19 +326,30 @@ def create_direction():
 
 @app.patch("/api/directions/<int:direction_id>")
 def update_direction(direction_id):
-    if get_direction_or_none(direction_id) is None:
+    old = get_direction_or_none(direction_id)
+    if old is None:
         return not_found("方向不存在")
     body = json_body()
-    err, name = _text_field(body, "name", "方向名称", required=True)
-    if err:
-        return err
-    err, description = _text_field(body, "description", "方向描述")
-    if err:
-        return err
+    # 严格部分更新（V4 用户审查 #2）：字段在则校验并更新、不在则保留原值——
+    # 原实现 name 必填且全字段 UPDATE，只提交 name 会静默清空描述、只提交描述直接 400
+    updates = {}
+    if "name" in body:
+        err, name = _text_field(body, "name", "方向名称", required=True)
+        if err:
+            return err
+        updates["name"] = name
+    if "description" in body:
+        err, description = _text_field(body, "description", "方向描述")
+        if err:
+            return err
+        updates["description"] = description
+    if not updates:
+        return bad_request("至少提供 name 或 description 中的一个字段")
+    merged = {"name": old["name"], "description": old["description"], **updates}
     db = get_db()
     db.execute(
         "UPDATE directions SET name = ?, description = ? WHERE id = ?",
-        (name, description, direction_id),
+        (merged["name"], merged["description"], direction_id),
     )
     db.commit()
     return jsonify({"ok": True})
@@ -378,18 +417,29 @@ def create_phase(direction_id):
 @app.patch("/api/phases/<int:phase_id>")
 def update_phase(phase_id):
     db = get_db()
-    if row_dict(db.execute("SELECT id FROM phases WHERE id = ?", (phase_id,)).fetchone()) is None:
+    old = row_dict(db.execute(
+        "SELECT name, goal FROM phases WHERE id = ?", (phase_id,)).fetchone())
+    if old is None:
         return not_found("阶段不存在")
     body = json_body()
-    err, name = _text_field(body, "name", "阶段名称", required=True)
-    if err:
-        return err
-    err, goal = _text_field(body, "goal", "阶段目标")
-    if err:
-        return err
+    # 严格部分更新（V4 用户审查 #2），语义同 update_direction
+    updates = {}
+    if "name" in body:
+        err, name = _text_field(body, "name", "阶段名称", required=True)
+        if err:
+            return err
+        updates["name"] = name
+    if "goal" in body:
+        err, goal = _text_field(body, "goal", "阶段目标")
+        if err:
+            return err
+        updates["goal"] = goal
+    if not updates:
+        return bad_request("至少提供 name 或 goal 中的一个字段")
+    merged = {**old, **updates}
     db.execute(
         "UPDATE phases SET name = ?, goal = ? WHERE id = ?",
-        (name, goal, phase_id),
+        (merged["name"], merged["goal"], phase_id),
     )
     db.commit()
     return jsonify({"ok": True})
@@ -533,10 +583,11 @@ def move_task(task_id):
     if task is None:
         return not_found("任务不存在")
     body = json_body()
-    try:
-        target_phase_id = int(body.get("phase_id"))
-    except (TypeError, ValueError):
-        return bad_request("phase_id 不能为空")
+    # 严格整数（V4 用户审查 #3）：int() 会把 1.5 / true / "1" 静默转换接受，
+    # 与 minutes 的严格口径一致（V3.1 决议：禁止静默截断）
+    target_phase_id = body.get("phase_id")
+    if not _is_int(target_phase_id):
+        return bad_request("phase_id 必须是整数")
     cur_phase = row_dict(db.execute(
         "SELECT direction_id FROM phases WHERE id = ?", (task["phase_id"],)).fetchone())
     target_phase = row_dict(db.execute(
@@ -595,6 +646,10 @@ def create_log(direction_id):
         day = parse_date(body.get("date") or date.today().isoformat()).isoformat()
     except ValueError as e:
         return bad_request(str(e))
+    # 未来日期拒绝（V4 用户审查 #4）：日志语义是「已发生的学习」，未来日期会
+    # 污染累计时长/活跃天数/热力图（9999-12-31 曾被接受并计入统计）
+    if day > date.today().isoformat():
+        return bad_request(f"日志日期不能在未来（今天是 {date.today().isoformat()}）")
     raw_minutes = body.get("minutes")
     minutes = 0 if raw_minutes is None else _parse_minutes(raw_minutes)
     if minutes is None:
@@ -628,6 +683,9 @@ def update_log(log_id):
             new_date = parse_date(body["date"]).isoformat()
         except ValueError as e:
             return bad_request(str(e))
+        # 与 create_log 同口径（V4 用户审查 #4）：PATCH 也能写入未来日期，一并拒绝
+        if new_date > date.today().isoformat():
+            return bad_request(f"日志日期不能在未来（今天是 {date.today().isoformat()}）")
     minutes = log["minutes"]
     if "minutes" in body:
         minutes = _parse_minutes(body["minutes"])
@@ -792,15 +850,7 @@ def review_queue(direction_id):
     new_cards = [r for r, c in cards if c.last_review is None]
 
     # 今日已引入的新卡数（限制在本方向内）：每张卡的首条复习记录落在今天
-    introduced = db.execute(
-        """SELECT COUNT(*) AS n FROM (
-               SELECT l.card_id, MIN(l.reviewed_at) AS first_at
-               FROM review_logs l JOIN cards c ON c.id = l.card_id
-               WHERE c.direction_id = ?
-               GROUP BY l.card_id)
-           WHERE first_at >= ?""",
-        (direction_id, day_start),
-    ).fetchone()["n"]
+    introduced = _introduced_new_today(db, direction_id)
     new_allowance = max(0, REVIEW_NEW_LIMIT - introduced)
     queue = due_cards + new_cards[:new_allowance]
 
@@ -840,6 +890,13 @@ def review_card(card_id):
         card = card_from_json(row["fsrs"])
     except ValueError:
         return bad_request("卡片调度状态数据损坏，无法复习")
+    # 服务端强制每日新卡上限（V4 用户审查 #5）：队列按 REVIEW_NEW_LIMIT 截新卡，
+    # 但评分接口此前不设防——直接调用可复习第 11 张。口径与队列同一函数：
+    # 新卡首评（last_review 为空）时，今日已引入数 ≥ 上限则拒绝；学习步骤内的
+    # 再次评分（last_review 非空）与到期卡评分不受限，不伤 FSRS 正常流程
+    if card.last_review is None and \
+            _introduced_new_today(db, row["direction_id"]) >= REVIEW_NEW_LIMIT:
+        return bad_request("今日新卡学习上限已用完，明天再来或先复习到期卡")
     now = utcnow()
     card, _log = review(card, rating, when=now)
     db.execute(
@@ -1110,12 +1167,14 @@ _BACKUP_SPEC = {
     ],
     "phases": [
         ("id", _is_int, "ID"),
+        ("direction_id", _is_int, "所属方向"),
         ("name", _is_nonempty_str, "名称"),
         ("goal", _opt(_is_optional_text), "目标"),
         ("sort_order", _opt(_is_sort_order), "排序序号"),
     ],
     "tasks": [
         ("id", _is_int, "ID"),
+        ("phase_id", _is_int, "所属阶段"),
         ("title", _is_nonempty_str, "标题"),
         ("note", _opt(_is_optional_text), "备注"),
         ("status", _is_status, "状态"),
@@ -1124,12 +1183,14 @@ _BACKUP_SPEC = {
     ],
     "logs": [
         ("id", _is_int, "ID"),
+        ("direction_id", _is_int, "所属方向"),
         ("date", _is_iso_date, "日期"),
         ("minutes", _opt(_is_minutes), "时长"),
         ("content", _opt(_is_optional_text), "内容"),
     ],
     "cards": [
         ("id", _is_int, "ID"),
+        ("direction_id", _is_int, "所属方向"),
         ("front", _is_nonempty_str, "正面"),
         ("back", _opt(_is_optional_text), "背面"),
         ("fsrs", is_valid_fsrs, "调度状态"),
@@ -1137,6 +1198,7 @@ _BACKUP_SPEC = {
     ],
     "review_logs": [
         ("id", _is_int, "ID"),
+        ("card_id", _is_int, "所属卡片"),
         ("rating", _is_rating, "评分"),
         ("reviewed_at", _is_utc_iso, "复习时间"),
     ],
@@ -1159,7 +1221,9 @@ def _valid_backup(body):
     if body.get("app") != BACKUP_APP_ID:
         return "不是有效的 study tools 备份文件"
     version = body.get("version")
-    if version not in ACCEPTED_VERSIONS:
+    # 严格 int 且排除 bool（V4 用户审查 #1）：set 成员测试对 list/dict 直接 TypeError
+    # 变 500；True == 1、2.0 == 2 会被 in 的相等语义错误放行
+    if not _is_int(version) or version not in ACCEPTED_VERSIONS:
         if _is_int(version) and version > max(ACCEPTED_VERSIONS):
             return (f"备份版本 {version} 高于本程序支持的 {max(ACCEPTED_VERSIONS)}，"
                     "请升级程序后再导入")

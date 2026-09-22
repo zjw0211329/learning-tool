@@ -23,6 +23,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.join(os.path.dirname(HERE), "app")
 sys.path.insert(0, APP_DIR)
 
+# Windows 默认 GBK 控制台打印「↔」等字符会 UnicodeEncodeError 直接崩掉整轮测试
+# （V4 用户审查 #7）；无 reconfigure 的非交互环境保持原样不折腾
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 QA_URL = os.environ.get("STUDY_TOOLS_URL", "").rstrip("/")
 QA_DIR = "__QA_临时方向__"
 
@@ -175,6 +180,10 @@ s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": True, "content": 
 check("布尔时长 → 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"date": "2026-9-1", "minutes": 5})
 check("非法日期格式 → 400", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"date": "9999-12-31", "minutes": 5})
+check("未来日期 → 400（原可写入并污染累计/活跃/热力图统计）", s == 400, s)
+s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"date": "9999-12-31"})
+check("编辑日志为未来日期 → 400（与 POST 同口径）", s == 400, s)
 s, _ = call("POST", "/api/directions/999999/logs", {"minutes": 5})
 check("不存在方向的日志 → 404", s == 404, s)
 s, _ = call("PATCH", f"/api/logs/{lg['id']}", {"minutes": 90})
@@ -191,6 +200,27 @@ s, _ = call("POST", "/api/directions", {"name": "文本方向", "description": {
 check("方向描述为对象 → 400（原静默吞掉）", s == 400, s)
 s, _ = call("PATCH", f"/api/directions/{did}", {"name": 123})
 check("编辑方向名称非字符串 → 400", s == 400, s)
+# 严格部分更新（V4 用户审查 #2）：字段在则更新、不在则保留——
+# 原实现 name 必填且全字段 UPDATE，只提交 name 会静默清空描述、只提交描述直接 400
+s, _ = call("PATCH", f"/api/directions/{did}", {"description": "部分更新描述"})
+check("PATCH 只提交 description → 200（原 400）", s == 200, s)
+s, _ = call("PATCH", f"/api/directions/{did}", {"name": QA_DIR + "·改"})
+_, rm_pu = get(f"/api/directions/{did}/roadmap")
+check("部分更新：只改 name 不清空 description（原静默清空）",
+      s == 200 and rm_pu["direction"]["name"] == QA_DIR + "·改"
+      and rm_pu["direction"]["description"] == "部分更新描述", rm_pu["direction"])
+s, _ = call("PATCH", f"/api/directions/{did}", {})
+check("PATCH 空对象（无字段可更新）→ 400", s == 400, s)
+call("PATCH", f"/api/directions/{did}", {"name": QA_DIR})  # 复原名貌，不动 description
+s, _ = call("PATCH", f"/api/phases/{ph1['id']}", {"goal": "部分更新目标"})
+check("阶段 PATCH 只提交 goal → 200（原 400）", s == 200, s)
+s, _ = call("PATCH", f"/api/phases/{ph1['id']}", {"name": "阶段名·改"})
+_, rm_pu2 = get(f"/api/directions/{did}/roadmap")
+_p1 = next(p for p in rm_pu2["phases"] if p["id"] == ph1["id"])
+check("阶段部分更新：只改 name 不清空 goal",
+      s == 200 and _p1["name"] == "阶段名·改" and _p1["goal"] == "部分更新目标", _p1)
+s, _ = call("PATCH", f"/api/phases/{ph1['id']}", {})
+check("阶段 PATCH 空对象 → 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/phases", {"name": 123})
 check("阶段名称非字符串 → 400（原 500）", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/phases", {"name": "文本阶段", "goal": 456})
@@ -216,6 +246,10 @@ s, _ = call("POST", f"/api/phases/{ph1['id']}/reorder", [1])
 check("reorder 顶层非对象 → 400（原 500）", s == 400, s)
 s, _ = call("POST", f"/api/tasks/{t1['id']}/move", "x")
 check("move 顶层非对象 → 400（原 500）", s == 400, s)
+# phase_id 严格整数（V4 用户审查 #3）：int() 原来会把 1.5 / true / "1" 静默转换接受
+for desc, v in (("浮点", ph1["id"] + 0.5), ("字符串", str(ph1["id"])), ("布尔", True)):
+    s, _ = call("POST", f"/api/tasks/{t1['id']}/move", {"phase_id": v})
+    check(f"move phase_id 为{desc} → 400（原被 int() 静默转换）", s == 400, s)
 s, _ = call("POST", "/api/import", [1, 2])
 check("import 顶层非对象 → 400（原 500）", s == 400, s)
 
@@ -267,6 +301,9 @@ for path, min_bytes in (("/", 500), ("/static/app.js", 3000), ("/static/style.cs
                         ("/static/vendor/echarts.min.js", 200000)):
     s, n = raw_get(path)
     check(f"{path} → 200 且非空", s == 200 and n >= min_bytes, f"{s}, {n}B")
+s, n = raw_get("/favicon.ico")
+check("/favicon.ico → 200（浏览器默认请求，原 404；图标源 assets/studytool.ico）",
+      s == 200 and n >= 1000, f"{s}, {n}B")
 
 # 启动器换行符护栏（run.bat 闪退事故的防回归）：cmd 按 GBK 解析批处理，
 # UTF-8 中文注释 + LF 行尾会吞掉下一行首字符（python→ython、pause→ause，
@@ -505,6 +542,17 @@ if _client is not None:
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("done_at", "2026-W01-1")))
     check("done_at 为 ISO 周日期 → 400", s == 400, s)
+    # version 严格类型（V4 用户审查 #1）：数组/对象在 set 成员测试上直接
+    # TypeError → 500；True==1、2.0==2 被 in 的相等语义错误放行
+    for desc, v in (("数组", [1]), ("对象", {"v": 2}), ("布尔", True), ("浮点", 2.0)):
+        s, _ = call("POST", "/api/import", _mutate(
+            lambda b: b.__setitem__("version", v)))
+        check(f"version 为{desc} → 400（原 500 / 误接受）", s == 400, s)
+    # 外键字段为不可哈希类型：原来在外键段的 set 成员测试上 TypeError → 500，
+    # 现在声明表先拒（400，带中文标签）
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["phases"][0].__setitem__("direction_id", [1])))
+    check("外键字段为数组 → 400（原 TypeError 500）", s == 400, s)
     # sort_order 为 null / 缺失是安全的（导入时归 0），不应被拒
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("sort_order", None)))
@@ -790,6 +838,16 @@ logs9 = [r for r in bk9["review_logs"] if r["card_id"] == made[0]["id"]]
 check("评分落 review_logs（2 条、评分=3、UTC ISO）",
       len(logs9) == 2 and all(r["rating"] == 3 for r in logs9)
       and all(r["reviewed_at"].endswith("+00:00") for r in logs9), len(logs9))
+
+# 服务端强制每日新卡上限（V4 用户审查 #5）：队列把 12 张新卡截到 10，但评分
+# 接口原来不设防——直接调用可复习第 11 张。把当日配额耗尽（已耗 1，再评队列
+# 剩余 9 张新卡）后，对队列外第 11 张直接评分 → 400
+for c9 in made[1:10]:
+    call("POST", f"/api/cards/{c9['id']}/review", {"rating": 3})
+s, _ = call("POST", f"/api/cards/{made[10]['id']}/review", {"rating": 3})
+check("配额耗尽后第 11 张新卡直接评分 → 400（原 200，绕过队列上限）", s == 400, s)
+s, _ = call("POST", f"/api/cards/{made[0]['id']}/review", {"rating": 3})
+check("配额耗尽不影响已学卡（last_review 非空）的后续评分", s == 200, s)
 
 # 编辑 / 删除 / 级联
 s, e9 = call("PATCH", f"/api/cards/{made[1]['id']}", {"front": "改过的正面", "back": "新背面"})
