@@ -39,6 +39,9 @@ failures = []
 def _make_test_client():
     import database
     tmp = tempfile.mkdtemp(prefix="study_tools_qa_")
+    # 崩溃路径（断言失败/异常退出）也清掉临时库，不在 %TEMP% 留残骸
+    import atexit
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     database.DB_PATH = os.path.join(tmp, "study.db")
     database.DATA_DIR = tmp
     import main

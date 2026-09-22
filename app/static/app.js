@@ -486,7 +486,15 @@ const app = createApp({
     async rateCard(rating) {
       const card = this.currentCard;
       if (!card) return;
-      await this.api(`/api/cards/${card.id}/review`, { method: "POST", body: { rating } });
+      try {
+        await this.api(`/api/cards/${card.id}/review`, { method: "POST", body: { rating } });
+      } catch (_) {
+        // 评分被拒（如并发标签页先一步把新卡配额用光）时也必须刷新队列——
+        // 否则屏幕上留着一张永远评不动的旧卡（Qoder 并发实测）；失败原因
+        // api() 已 toast。reviewFlipped 在 loadQueue 内复位，不会露出反面
+        await this.loadQueue();
+        return;
+      }
       // 队列/计数/卡片列表刷新；方向列表一起刷，详情页徽标保持同步
       await Promise.all([this.loadQueue(), this.loadCards(), this.loadDirections()]);
     },
