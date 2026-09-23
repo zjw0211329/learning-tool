@@ -576,6 +576,14 @@ if _client is not None:
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("sort_order", 2**63)))
     check("备份 sort_order 超 int64 → 400（原 500）", s == 400, s)
+    # 兜底分支专用探针（Qoder 复验发现）：上面四条都被声明表先拒，validator
+    # 与 fallback 互为顶包——拆掉 import 的 except OverflowError 后 299 仍全绿。
+    # created_at 不在 _BACKUP_SPEC 里，超大值直通 INSERT 抛 OverflowError，
+    # 只能靠兜底转 400（这条断言拆兜底即红，fallback 独立承重）
+    s, res_fb = call("POST", "/api/import", _mutate(
+        lambda b: b["directions"][0].__setitem__("created_at", 10**30)))
+    check("spec 外字段超大整数 → 兜底 400（原 500，且非声明表拦截）",
+          s == 400 and res_fb and "已回滚" in res_fb.get("error", ""), (s, res_fb))
     # sort_order 为 null / 缺失是安全的（导入时归 0），不应被拒
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("sort_order", None)))
