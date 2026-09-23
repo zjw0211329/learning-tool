@@ -181,6 +181,10 @@ s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": 25.5, "content": 
 check("浮点时长 → 400（不再被 int() 静默截断，Qoder TD1 附注）", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": True, "content": "x"})
 check("布尔时长 → 400", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": 2**63, "content": "x"})
+check("超大时长（> int64）→ 400（原绑参 OverflowError 500）", s == 400, s)
+s, _ = call("POST", f"/api/directions/{did}/logs", {"minutes": 1_000_001, "content": "x"})
+check("超业务上限时长（> 10^6 分钟）→ 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"date": "2026-9-1", "minutes": 5})
 check("非法日期格式 → 400", s == 400, s)
 s, _ = call("POST", f"/api/directions/{did}/logs", {"date": "9999-12-31", "minutes": 5})
@@ -253,6 +257,8 @@ check("move 顶层非对象 → 400（原 500）", s == 400, s)
 for desc, v in (("浮点", ph1["id"] + 0.5), ("字符串", str(ph1["id"])), ("布尔", True)):
     s, _ = call("POST", f"/api/tasks/{t1['id']}/move", {"phase_id": v})
     check(f"move phase_id 为{desc} → 400（原被 int() 静默转换）", s == 400, s)
+s, _ = call("POST", f"/api/tasks/{t1['id']}/move", {"phase_id": 2**63})
+check("move phase_id 超 int64 → 400（原绑参 OverflowError 500）", s == 400, s)
 s, _ = call("POST", "/api/import", [1, 2])
 check("import 顶层非对象 → 400（原 500）", s == 400, s)
 
@@ -556,6 +562,20 @@ if _client is not None:
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["phases"][0].__setitem__("direction_id", [1])))
     check("外键字段为数组 → 400（原 TypeError 500）", s == 400, s)
+    # 超大整数（V4 用户审查 P2）：id / minutes / sort_order 超出 SQLite int64
+    # 绑参范围，原来 INSERT 阶段 OverflowError → 500；负 id 顺带收紧（真实导出永远正数）
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["directions"][0].__setitem__("id", 2**63)))
+    check("备份 id 超 int64 → 400（原 500）", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["directions"][0].__setitem__("id", -1)))
+    check("备份 id 为负 → 400", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["logs"][0].__setitem__("minutes", 2**63)))
+    check("备份时长超 int64 → 400（原 500）", s == 400, s)
+    s, _ = call("POST", "/api/import", _mutate(
+        lambda b: b["tasks"][0].__setitem__("sort_order", 2**63)))
+    check("备份 sort_order 超 int64 → 400（原 500）", s == 400, s)
     # sort_order 为 null / 缺失是安全的（导入时归 0），不应被拒
     s, _ = call("POST", "/api/import", _mutate(
         lambda b: b["tasks"][0].__setitem__("sort_order", None)))
@@ -908,6 +928,48 @@ if _client is not None:
           next(d for d in dirs9d if d["id"] == d9cid)["due_today"] == 1,
           [d.get("due_today") for d in dirs9d])
     call("DELETE", f"/api/directions/{d9cid}")
+
+    # 9.3a 并发评分原子性（V4 用户审查 P2，仅临时库模式）：两线程同时抢最后
+    # 一个新卡名额。原实现 check-then-act 之间无互斥——双双 200、当日 9→11；
+    # BEGIN IMMEDIATE 写锁串行化后恰好一胜一败。同一张卡并发重复评分的
+    # lost-update（两个请求基于同一旧 fsrs 状态计算）由同一把锁消除
+    import threading
+
+    s, d9p = call("POST", "/api/directions", {"name": QA_DIR, "description": "并发边界"})
+    d9pid = d9p["id"]
+    race_ids = []
+    for i in range(11):
+        _, c10 = call("POST", f"/api/directions/{d9pid}/cards",
+                      {"front": f"并发卡{i}", "back": ""})
+        race_ids.append(c10["id"])
+    for cid in race_ids[:9]:          # 顺序消耗 9 个配额，剩 1 个
+        call("POST", f"/api/cards/{cid}/review", {"rating": 3})
+
+    import main as main_mod
+    race_results = []
+    race_barrier = threading.Barrier(2)
+
+    def _racer(card_id):
+        cli = main_mod.app.test_client()   # 每线程独立 client，context 各自 push/pop
+        race_barrier.wait()                # 对齐起跑线，最大化竞态窗口
+        r = cli.post(f"/api/cards/{card_id}/review", json={"rating": 3})
+        race_results.append(r.status_code)
+
+    th1 = threading.Thread(target=_racer, args=(race_ids[9],))
+    th2 = threading.Thread(target=_racer, args=(race_ids[10],))
+    th1.start(); th2.start(); th1.join(10); th2.join(10)
+    check("并发抢最后名额 → 恰好一胜一败（原双双 200、当日 9→11）",
+          sorted(race_results) == [200, 400], race_results)
+    _, q10 = get(f"/api/directions/{d9pid}/review/queue")
+    check("并发后当日配额仍守上限（done_today=10 而非 11）",
+          q10["counts"]["done_today"] == 10 and q10["counts"]["new"] == 0,
+          q10.get("counts"))
+    _, race_cards = get(f"/api/directions/{d9pid}/cards")
+    unreviewed = [c for c in race_cards if c["fsrs"] and c["fsrs"]["last_review"] is None]
+    check("两张争抢卡恰有一张被引入（另一张仍为新卡，配额未被击穿）",
+          len(unreviewed) == 1 and unreviewed[0]["id"] in (race_ids[9], race_ids[10]),
+          [c["id"] for c in race_cards])
+    call("DELETE", f"/api/directions/{d9pid}")
 
     # 9.3b 坏 fsrs 不打死页面（Qoder 轮审缺陷 4，同一模式的第三次收口）：
     # 列表/队列/徽标/导出保持 200，坏行降级 corrupt 标记 → 前端渲染出删除按钮自救

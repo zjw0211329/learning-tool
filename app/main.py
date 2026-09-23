@@ -190,13 +190,14 @@ def _introduced_new_today(db, direction_id):
 
 
 def _parse_minutes(value):
-    """时长必须是严格的非负整数（bool 除外），否则返回 None。
+    """时长必须是严格的非负整数（bool 除外）且 ≤ 10^6 分钟，否则返回 None。
 
     原实现 int(body.get(...)) 会把 25.5 静默截成 25、把 true 存成 1 —— 报错
     文案写着「必须是非负整数」却并不执行（Qoder TD1 附注的糊涂账）。现在浮点
-    一律 400，与备份导入的 minutes 校验同口径。
+    一律 400，与备份导入的 minutes 校验同口径。上限挡超大整数绑参 OverflowError
+    （V4 用户审查 P2：> 2^63-1 曾直接 500）。
     """
-    return value if _is_int(value) and value >= 0 else None
+    return value if _is_int(value) and 0 <= value <= _VALUE_MAX else None
 
 
 def _text_field(body, key, label, required=False):
@@ -584,10 +585,11 @@ def move_task(task_id):
         return not_found("任务不存在")
     body = json_body()
     # 严格整数（V4 用户审查 #3）：int() 会把 1.5 / true / "1" 静默转换接受，
-    # 与 minutes 的严格口径一致（V3.1 决议：禁止静默截断）
+    # 与 minutes 的严格口径一致（V3.1 决议：禁止静默截断）；id 范围校验挡
+    # 超大整数绑参 OverflowError（V4 用户审查 P2）
     target_phase_id = body.get("phase_id")
-    if not _is_int(target_phase_id):
-        return bad_request("phase_id 必须是整数")
+    if not _is_db_id(target_phase_id):
+        return bad_request("phase_id 必须是有效整数")
     cur_phase = row_dict(db.execute(
         "SELECT direction_id FROM phases WHERE id = ?", (task["phase_id"],)).fetchone())
     target_phase = row_dict(db.execute(
@@ -877,37 +879,51 @@ def review_card(card_id):
 
     reviewed_at 与调度用的 review_datetime 是同一个值 —— 复习记录和卡片状态
     严格对应同一次计算。
+    并发安全（V4 用户审查 P2）：「读卡 → 上限检查 → 写回」整体放在 BEGIN
+    IMMEDIATE 写锁事务内。SQLite 写锁天然串行化：并发请求中第二个会在拿锁处
+    等待（busy_timeout 5s），等第一个提交后读到的已是新鲜状态——否则两个
+    请求同时争抢最后一个新卡名额会双双 200（当日 9→11），同一张卡并发重复
+    评分也会写两条 review_logs（用户实测复现）。rating 形状校验无状态，留在锁外。
     """
-    db = get_db()
-    row = row_dict(db.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
-    if row is None:
-        return not_found("卡片不存在")
     body = json_body()
     rating = body.get("rating")
     if not _is_int(rating) or rating not in (1, 2, 3, 4):
         return bad_request("rating 必须是 1~4 的整数（1 忘记 / 2 困难 / 3 良好 / 4 简单）")
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
     try:
-        card = card_from_json(row["fsrs"])
-    except ValueError:
-        return bad_request("卡片调度状态数据损坏，无法复习")
-    # 服务端强制每日新卡上限（V4 用户审查 #5）：队列按 REVIEW_NEW_LIMIT 截新卡，
-    # 但评分接口此前不设防——直接调用可复习第 11 张。口径与队列同一函数：
-    # 新卡首评（last_review 为空）时，今日已引入数 ≥ 上限则拒绝；学习步骤内的
-    # 再次评分（last_review 非空）与到期卡评分不受限，不伤 FSRS 正常流程
-    if card.last_review is None and \
-            _introduced_new_today(db, row["direction_id"]) >= REVIEW_NEW_LIMIT:
-        return bad_request("今日新卡学习上限已用完，明天再来或先复习到期卡")
-    now = utcnow()
-    card, _log = review(card, rating, when=now)
-    db.execute(
-        "UPDATE cards SET fsrs = ?, due = ? WHERE id = ?",
-        (card_to_json(card), due_of(card), card_id),
-    )
-    db.execute(
-        "INSERT INTO review_logs(card_id, rating, reviewed_at) VALUES (?, ?, ?)",
-        (card_id, rating, now.isoformat()),
-    )
-    db.commit()
+        row = row_dict(db.execute(
+            "SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
+        if row is None:
+            db.rollback()
+            return not_found("卡片不存在")
+        try:
+            card = card_from_json(row["fsrs"])
+        except ValueError:
+            db.rollback()
+            return bad_request("卡片调度状态数据损坏，无法复习")
+        # 服务端强制每日新卡上限（V4 用户审查 #5）：队列按 REVIEW_NEW_LIMIT 截新卡，
+        # 但评分接口此前不设防——直接调用可复习第 11 张。口径与队列同一函数：
+        # 新卡首评（last_review 为空）时，今日已引入数 ≥ 上限则拒绝；学习步骤内的
+        # 再次评分（last_review 非空）与到期卡评分不受限，不伤 FSRS 正常流程
+        if card.last_review is None and \
+                _introduced_new_today(db, row["direction_id"]) >= REVIEW_NEW_LIMIT:
+            db.rollback()
+            return bad_request("今日新卡学习上限已用完，明天再来或先复习到期卡")
+        now = utcnow()
+        card, _log = review(card, rating, when=now)
+        db.execute(
+            "UPDATE cards SET fsrs = ?, due = ? WHERE id = ?",
+            (card_to_json(card), due_of(card), card_id),
+        )
+        db.execute(
+            "INSERT INTO review_logs(card_id, rating, reviewed_at) VALUES (?, ?, ?)",
+            (card_id, rating, now.isoformat()),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return jsonify(_card_view(row_dict(db.execute(
         "SELECT * FROM cards WHERE id = ?", (card_id,)
     ).fetchone())))
@@ -1083,6 +1099,18 @@ def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+# SQLite 整数绑参上限（超出 → OverflowError → 500，与 V3.1 修过的 limit 同机理）；
+# minutes/sort_order 的业务上限与 limit 同数量级：10^6 分钟 ≈ 1.9 年，个人数据
+# 量级的天文数字（V4 用户审查 P2）
+_SQLITE_INT64_MAX = 2**63 - 1
+_VALUE_MAX = 1_000_000
+
+
+def _is_db_id(value):
+    """主键 / 外键 id：正整数且在 SQLite int64 范围内（超大 id 绑参会 500）。"""
+    return _is_int(value) and 0 < value <= _SQLITE_INT64_MAX
+
+
 def _is_iso_date(text):
     """必须是规范的 YYYY-MM-DD 且是真实存在的日历日期。
 
@@ -1109,13 +1137,15 @@ def _is_optional_text(value):
 
 
 def _is_sort_order(value):
-    # None 放行（导入时按 0 处理）；字符串会导致之后 MAX(sort_order)+1 变 str+int → 500
-    return value is None or _is_int(value)
+    # None 放行（导入时按 0 处理）；字符串会导致之后 MAX(sort_order)+1 变 str+int → 500；
+    # 上限挡超大整数绑参 OverflowError（V4 用户审查 P2）
+    return value is None or (_is_int(value) and 0 <= value <= _VALUE_MAX)
 
 
 def _is_minutes(value):
-    # minutes 不允许 None（与 sort_order 的历史行为刻意不同，保持不变）
-    return _is_int(value) and value >= 0
+    # minutes 不允许 None（与 sort_order 的历史行为刻意不同，保持不变）；
+    # 上限与 _parse_minutes 同口径（V4 用户审查 P2）
+    return _is_int(value) and 0 <= value <= _VALUE_MAX
 
 
 def _is_status(value):
@@ -1161,20 +1191,20 @@ def _opt(fn):
 # 中文标签用于报错文案（NFR5：toast 是用户唯一能看到的诊断信息）。
 _BACKUP_SPEC = {
     "directions": [
-        ("id", _is_int, "ID"),
+        ("id", _is_db_id, "ID"),
         ("name", _is_nonempty_str, "名称"),
         ("description", _opt(_is_optional_text), "描述"),
     ],
     "phases": [
-        ("id", _is_int, "ID"),
-        ("direction_id", _is_int, "所属方向"),
+        ("id", _is_db_id, "ID"),
+        ("direction_id", _is_db_id, "所属方向"),
         ("name", _is_nonempty_str, "名称"),
         ("goal", _opt(_is_optional_text), "目标"),
         ("sort_order", _opt(_is_sort_order), "排序序号"),
     ],
     "tasks": [
-        ("id", _is_int, "ID"),
-        ("phase_id", _is_int, "所属阶段"),
+        ("id", _is_db_id, "ID"),
+        ("phase_id", _is_db_id, "所属阶段"),
         ("title", _is_nonempty_str, "标题"),
         ("note", _opt(_is_optional_text), "备注"),
         ("status", _is_status, "状态"),
@@ -1182,23 +1212,23 @@ _BACKUP_SPEC = {
         ("done_at", _opt(_is_date_or_none), "完成时间"),
     ],
     "logs": [
-        ("id", _is_int, "ID"),
-        ("direction_id", _is_int, "所属方向"),
+        ("id", _is_db_id, "ID"),
+        ("direction_id", _is_db_id, "所属方向"),
         ("date", _is_iso_date, "日期"),
         ("minutes", _opt(_is_minutes), "时长"),
         ("content", _opt(_is_optional_text), "内容"),
     ],
     "cards": [
-        ("id", _is_int, "ID"),
-        ("direction_id", _is_int, "所属方向"),
+        ("id", _is_db_id, "ID"),
+        ("direction_id", _is_db_id, "所属方向"),
         ("front", _is_nonempty_str, "正面"),
         ("back", _opt(_is_optional_text), "背面"),
         ("fsrs", is_valid_fsrs, "调度状态"),
         ("due", _is_utc_iso, "到期时间"),
     ],
     "review_logs": [
-        ("id", _is_int, "ID"),
-        ("card_id", _is_int, "所属卡片"),
+        ("id", _is_db_id, "ID"),
+        ("card_id", _is_db_id, "所属卡片"),
         ("rating", _is_rating, "评分"),
         ("reviewed_at", _is_utc_iso, "复习时间"),
     ],
@@ -1327,8 +1357,9 @@ def import_data():
                 "INSERT INTO review_logs(id, card_id, rating, reviewed_at) VALUES (?, ?, ?, ?)",
                 (r["id"], r["card_id"], r["rating"], r["reviewed_at"]))
         db.commit()
-    except (sqlite3.Error, KeyError, TypeError, ValueError) as e:
-        # 校验已挡掉绝大多数畸形数据；这里兜底，保证任何失败都是 400 + 回滚而不是 500
+    except (sqlite3.Error, KeyError, TypeError, ValueError, OverflowError) as e:
+        # 校验已挡掉绝大多数畸形数据；这里兜底，保证任何失败都是 400 + 回滚而不是
+        # 500。OverflowError 独立于 ValueError（超大整数绑参，V4 用户审查 P2）
         db.rollback()
         return bad_request(f"导入失败，已回滚原数据：{e}")
     return jsonify({
