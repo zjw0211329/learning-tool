@@ -26,6 +26,17 @@ from review import (
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.teardown_appcontext(close_db)
 
+
+@app.before_request
+def _guard_path_int64():
+    """路径参数整数限界（全面检查 #6）：全部 <int:...> 路由的 id 超 SQLite
+    int64 时绑参 OverflowError 直接 500——与 FR13 已修的 body/limit 侧同一
+    机理，统一在触库前拦成 400。IntegerConverter 的 regex 是 \\d+，负数绑不
+    进来，id=0 维持下游 404 语义，只拦上溢。"""
+    for value in (request.view_args or {}).values():
+        if isinstance(value, int) and value > _SQLITE_INT64_MAX:
+            return bad_request("id 超出范围")
+
 TASK_STATUSES = ("todo", "doing", "done", "skipped")
 
 # 服务端口唯一出处（app.run 与自动开页共用——写在两处就会漏改，
@@ -71,9 +82,16 @@ def not_found(msg="资源不存在"):
 
 def parse_date(text, field="date"):
     try:
-        return date.fromisoformat(text)
+        d = date.fromisoformat(text)
     except (TypeError, ValueError):
         raise ValueError(f"{field} 格式应为 YYYY-MM-DD")
+    # round-trip 校验（对齐导入端 _is_iso_date，docs/05 §3.5「导入**等入口**」）：
+    # 3.11+ 的 fromisoformat 还接受 ISO 周日期（2026-W01-1 → 2025-12-29）与
+    # 无连字符基本格式（20260923），静默转换会把日志记到错误的日子——
+    # 同值导入端 400、写入端曾 201，入口不对称（全面检查 #4）
+    if d.isoformat() != text:
+        raise ValueError(f"{field} 格式应为 YYYY-MM-DD")
+    return d
 
 
 def get_direction_or_none(direction_id):
@@ -644,8 +662,11 @@ def create_log(direction_id):
     if get_direction_or_none(direction_id) is None:
         return not_found("方向不存在")
     body = json_body()
+    # date 缺省 = 今天；显式给了（含空串/null）就必须过格式校验，与 PATCH 同口径。
+    # 原来 `or` 短路把空串/null 静默归成今天，与 PATCH 侧空串 → 400 正相反（检查 #20）
+    raw_day = body["date"] if "date" in body else date.today().isoformat()
     try:
-        day = parse_date(body.get("date") or date.today().isoformat()).isoformat()
+        day = parse_date(raw_day).isoformat()
     except ValueError as e:
         return bad_request(str(e))
     # 未来日期拒绝（V4 用户审查 #4）：日志语义是「已发生的学习」，未来日期会
