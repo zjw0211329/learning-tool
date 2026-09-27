@@ -67,6 +67,10 @@ const app = createApp({
       toastMsg: "",
       toastTimer: null,
 
+      // 视图加载失败态（检查轮 #3 失败收口）：非空时各视图分区隐藏、切到
+      // 错误卡片，写操作随之禁用；具体原因 api() 已 toast
+      viewError: "",
+
       directions: [],
       showNewDir: false,
       newDir: { name: "", description: "" },
@@ -90,6 +94,7 @@ const app = createApp({
       reviewQueue: [],
       reviewCounts: null,
       reviewFlipped: false,
+      ratingBusy: false,
       cards: [],
       newCard: { front: "", back: "" },
 
@@ -138,6 +143,19 @@ const app = createApp({
       const e = new Error(msg);
       e.handled = true;
       return e;
+    },
+
+    // ---- 视图加载竞态防护（检查轮 #3）----
+    // 加载全部读 this.currentId 后直接赋值，乱序返回 = 最后完成者赢：快速切换
+    // 方向时详情页可渲染 A 的数据、写操作发往 B（threaded 服务下实测复现）。
+    // 每个加载通道一个单调序号，落地前校验仍是最新一次发起，过期响应整体丢弃。
+    _seq(key) {
+      if (!this._viewSeqs) this._viewSeqs = {};
+      this._viewSeqs[key] = (this._viewSeqs[key] || 0) + 1;
+      return this._viewSeqs[key];
+    },
+    _stale(key, seq) {
+      return !this._viewSeqs || this._viewSeqs[key] !== seq;
     },
 
     async api(url, options = {}) {
@@ -235,18 +253,40 @@ const app = createApp({
       if (!id) return;
       this.currentId = id;
       this.view = "detail";
+      this.viewError = ""; // 新导航重试，清上一轮失败态
       // 番茄钟不随切换方向重置：它绑定的是「开始时」的方向（见 pomoToggle）
       await Promise.all([this.loadRoadmap(), this.loadRecentLogs()]);
     },
 
     async loadRoadmap() {
-      this.detail = await this.api(`/api/directions/${this.currentId}/roadmap`);
-      this.currentDirection = this.detail.direction;
+      const seq = this._seq("roadmap");
+      try {
+        const data = await this.api(`/api/directions/${this.currentId}/roadmap`);
+        if (this._stale("roadmap", seq)) return; // 过期响应丢弃
+        this.detail = data;
+        this.currentDirection = data.direction;
+      } catch (_) {
+        if (this._stale("roadmap", seq)) return;
+        // 失败收口（Qoder 裁决）：清旧数据切错误态、随分区隐藏禁写——
+        // 静默跳首页掩盖失败，留着旧数据诱导把内容写进另一个方向
+        this.detail = { direction: null, phases: [] };
+        this.currentDirection = null;
+        this.viewError = "方向数据加载失败，可能已被其他标签页删除";
+      }
     },
 
     async loadRecentLogs() {
       // 侧栏只展示最近记录，避免方向日志变多后全量拉取
-      this.recentLogs = await this.api(`/api/directions/${this.currentId}/logs?limit=30`);
+      const seq = this._seq("recentLogs");
+      try {
+        const data = await this.api(`/api/directions/${this.currentId}/logs?limit=30`);
+        if (this._stale("recentLogs", seq)) return;
+        this.recentLogs = data;
+      } catch (_) {
+        if (this._stale("recentLogs", seq)) return;
+        this.recentLogs = [];
+        this.viewError = "方向数据加载失败，可能已被其他标签页删除";
+      }
     },
 
     async addPhase() {
@@ -361,22 +401,42 @@ const app = createApp({
       if (!id) return;
       this.currentId = id;
       this.view = "stats";
+      this.viewError = "";
       this.reviewDate = todayStr();
       await Promise.all([this.loadStats(), this.loadReview()]);
     },
 
     async loadStats() {
-      this.stats = await this.api(`/api/directions/${this.currentId}/stats`);
-      await this.$nextTick();
-      this.renderCharts();
+      const seq = this._seq("stats");
+      try {
+        const data = await this.api(`/api/directions/${this.currentId}/stats`);
+        if (this._stale("stats", seq)) return;
+        this.stats = data;
+        await this.$nextTick();
+        this.renderCharts();
+      } catch (_) {
+        if (this._stale("stats", seq)) return;
+        this.stats = null;
+        this.viewError = "统计数据加载失败，可能已被其他标签页删除";
+      }
     },
 
     async loadReview() {
-      this.review = await this.api(
-        `/api/directions/${this.currentId}/review?date=${this.reviewDate}`);
+      const seq = this._seq("review");
+      try {
+        const data = await this.api(
+          `/api/directions/${this.currentId}/review?date=${this.reviewDate}`);
+        if (this._stale("review", seq)) return;
+        this.review = data;
+      } catch (_) {
+        if (this._stale("review", seq)) return;
+        this.review = null;
+        this.viewError = "周报数据加载失败（具体原因见提示）";
+      }
     },
 
     shiftWeek(n) {
+      this.viewError = "";
       this.reviewDate = addDays(this.reviewDate, n * 7);
       this.loadReview();
     },
@@ -468,14 +528,32 @@ const app = createApp({
     },
 
     async loadCards() {
-      this.cards = await this.api(`/api/directions/${this.currentId}/cards`);
+      const seq = this._seq("cards");
+      try {
+        const data = await this.api(`/api/directions/${this.currentId}/cards`);
+        if (this._stale("cards", seq)) return;
+        this.cards = data;
+      } catch (_) {
+        if (this._stale("cards", seq)) return;
+        this.cards = [];
+        this.viewError = "复习数据加载失败，可能已被其他标签页删除";
+      }
     },
 
     async loadQueue() {
-      const data = await this.api(`/api/directions/${this.currentId}/review/queue`);
-      this.reviewQueue = data.queue;
-      this.reviewCounts = data.counts;
-      this.reviewFlipped = false;
+      const seq = this._seq("queue");
+      try {
+        const data = await this.api(`/api/directions/${this.currentId}/review/queue`);
+        if (this._stale("queue", seq)) return;
+        this.reviewQueue = data.queue;
+        this.reviewCounts = data.counts;
+        this.reviewFlipped = false;
+      } catch (_) {
+        if (this._stale("queue", seq)) return;
+        this.reviewQueue = [];
+        this.reviewCounts = null;
+        this.viewError = "复习数据加载失败，可能已被其他标签页删除";
+      }
     },
 
     flipCard() {
@@ -484,8 +562,13 @@ const app = createApp({
 
     // 四级评分（FR9.3）：忘记=1 / 困难=2 / 良好=3 / 简单=4
     async rateCard(rating) {
+      // 防连点（检查轮 #2）：后端有意放行串行重复评分，前端是唯一防线——
+      // 双击会把同一张卡评两次分，FSRS 调度应用两次、review_logs 双写、
+      // done_today 虚增。四按钮同步 :disabled="ratingBusy"
+      if (this.ratingBusy) return;
       const card = this.currentCard;
       if (!card) return;
+      this.ratingBusy = true;
       try {
         await this.api(`/api/cards/${card.id}/review`, { method: "POST", body: { rating } });
       } catch (_) {
@@ -494,6 +577,8 @@ const app = createApp({
         // api() 已 toast。reviewFlipped 在 loadQueue 内复位，不会露出反面
         await this.loadQueue();
         return;
+      } finally {
+        this.ratingBusy = false;
       }
       // 队列/计数/卡片列表刷新；方向列表一起刷，详情页徽标保持同步
       await Promise.all([this.loadQueue(), this.loadCards(), this.loadDirections()]);
@@ -541,11 +626,13 @@ const app = createApp({
     /* ---------- 导航 ---------- */
     goHome() {
       this.view = "home";
+      this.viewError = "";
       this.loadDirections();
     },
 
     goReview() {
       this.view = "review";
+      this.viewError = "";
       if (this._ensureCurrentId()) this.loadReviewAll();
     },
 
@@ -553,6 +640,7 @@ const app = createApp({
       const id = Number(ev.target.value);
       if (!id || id === this.currentId) return;
       this.currentId = id;
+      this.viewError = "";
       this.loadReviewAll();
     },
 
@@ -659,6 +747,7 @@ const app = createApp({
       }
       await this.loadDirections();
       // 导入是整库替换，原先停用的详情/统计/复习视图 id 可能已不存在，一并复位
+      this.viewError = "";
       this.currentId = null;
       this.currentDirection = null;
       this.detail = { direction: null, phases: [] };

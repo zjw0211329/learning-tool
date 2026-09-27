@@ -29,8 +29,19 @@
 
   <main class="container">
 
+    <!-- 视图加载失败（检查轮 #3 失败收口）：空态 + 一句为什么，各视图分区随
+         viewError 隐藏、写操作一并禁用；具体原因 api() 已 toast 提示 -->
+    <div v-if="viewError" class="card empty">
+      <div class="empty-emoji">⚠️</div>
+      <h2>数据加载失败</h2>
+      <p class="muted">{{ viewError }}</p>
+      <div class="empty-actions">
+        <button class="btn btn-primary" @click="goHome">返回总览</button>
+      </div>
+    </div>
+
     <!-- ============ 视图一：总览 ============ -->
-    <section v-if="view === 'home'">
+    <section v-if="view === 'home' && !viewError">
       <div class="page-head">
         <h1>我的学习方向</h1>
         <p class="muted">以方向为单位记录大学四年的每一步</p>
@@ -88,7 +99,7 @@
     </section>
 
     <!-- ============ 视图二：方向详情 ============ -->
-    <section v-if="view === 'detail'">
+    <section v-if="view === 'detail' && !viewError">
       <div class="page-head">
         <h1>{{ detail.direction ? detail.direction.name : '…' }}</h1>
         <p class="muted">{{ detail.direction ? detail.direction.description : '' }}</p>
@@ -211,7 +222,7 @@
     </section>
 
     <!-- ============ 视图三：统计回顾 ============ -->
-    <section v-if="view === 'stats'">
+    <section v-if="view === 'stats' && !viewError">
       <div class="page-head">
         <h1>统计与回顾</h1>
         <div class="summary-chips" v-if="stats">
@@ -281,7 +292,7 @@
     </section>
 
     <!-- ============ 视图四：复习卡片（V3 FR9） ============ -->
-    <section v-if="view === 'review'">
+    <section v-if="view === 'review' && !viewError">
     <div class="page-head review-head-v3">
       <h1>复习卡片</h1>
       <div class="form-row" v-if="directions.length >= 1">
@@ -314,10 +325,10 @@
             <p class="rc-label">反面</p>
             <p class="rc-text">{{ currentCard.back || '（无反面内容）' }}</p>
             <div class="rating-row">
-              <button class="rate rate-again" @click="rateCard(1)">忘记</button>
-              <button class="rate rate-hard" @click="rateCard(2)">困难</button>
-              <button class="rate rate-good" @click="rateCard(3)">良好</button>
-              <button class="rate rate-easy" @click="rateCard(4)">简单</button>
+              <button class="rate rate-again" :disabled="ratingBusy" @click="rateCard(1)">忘记</button>
+              <button class="rate rate-hard" :disabled="ratingBusy" @click="rateCard(2)">困难</button>
+              <button class="rate rate-good" :disabled="ratingBusy" @click="rateCard(3)">良好</button>
+              <button class="rate rate-easy" :disabled="ratingBusy" @click="rateCard(4)">简单</button>
             </div>
           </div>
 

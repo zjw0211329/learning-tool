@@ -1178,17 +1178,22 @@ def _is_date_or_none(value):
 
 
 def _is_utc_iso(value):
-    """UTC ISO 8601（必须以 +00:00 结尾）。
+    """UTC ISO 8601（必须以 +00:00 结尾，且为 fromisoformat 往返一致的规范形态）。
 
     due / reviewed_at 的 TEXT 字典序比较只在同构字符串下可靠（docs/06 §3 决议）；
-    混进 +08:00 之类的偏移串会悄悄破坏队列与徽标的比较语义。
+    混进 +08:00 之类的偏移串会悄悄破坏队列与徽标的比较语义。3.11+ 的
+    fromisoformat 还接受空格分隔、无连字符基本格式等非规范形态——入库后参与
+    日界字典序比较会把记录整体挪出「今天」，每日新卡配额随之失守（全面检查
+    #5 端到端实测），round-trip 相等一并拒绝。应用自产时间戳全是 isoformat()
+    输出（review.py 时间纪律），正常导出→导入循环不受影响。
     """
     if not isinstance(value, str) or not value.endswith("+00:00"):
         return False
     try:
-        return datetime.fromisoformat(value).tzinfo == timezone.utc
+        dt = datetime.fromisoformat(value)
     except ValueError:
         return False
+    return dt.tzinfo == timezone.utc and dt.isoformat() == value
 
 
 def _is_rating(value):
