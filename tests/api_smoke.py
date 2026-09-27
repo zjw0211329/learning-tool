@@ -736,6 +736,92 @@ if _client is not None:
     call("POST", "/api/import", backup)  # 还原
     _, dirs_ok3 = get("/api/directions")
     check("兼容矩阵探针均未破坏现库", len(dirs_ok3) == counts["directions"], len(dirs_ok3))
+
+    # ================= 产品轮对抗断言（全面检查 #4/#5/#6/#15）=================
+    # ZCode 8f64a92 / 62bfb3b / 35f319a 的收紧面。路径清单从 url_map 生成而不是
+    # 手抄——手抄清单本身就是「过定」的一种（新增路由不会有人想起来补断言）。
+    # -- #6 路径参数 int64：Werkzeug 的 IntegerConverter regex 是 \d+（不设上限），
+    #    超大 id 一路送进 SQL 绑参 → OverflowError 500；before_request 统一拦 400。
+    import re as _re
+    import main as _main_mod
+    _huge = 2**63
+    _INT_PAT = _re.compile(r"<int(?:\([^>]*\))?:[^>]+>")
+    _int_rules = []
+    for _r in _main_mod.app.url_map.iter_rules():
+        if not _INT_PAT.search(_r.rule):
+            continue
+        _int_rules.append((sorted(_r.methods - {"HEAD", "OPTIONS"})[0], _r.rule))
+    check(f"<int:> 路由清单自 url_map 取到（{len(_int_rules)} 条，≥24）",
+          len(_int_rules) >= 24, len(_int_rules))
+    _pbad = []
+    for _meth, _rule in _int_rules:
+        _u = _INT_PAT.sub(str(_huge), _rule)
+        s, b = call(_meth, _u, {})
+        if not (s == 400 and isinstance(b, dict) and "超出范围" in b.get("error", "")):
+            _pbad.append((_meth, _u, s, b))
+    check("全部 <int:> 路由的超大 id → 400「id 超出范围」（原逐路由 500）",
+          not _pbad, _pbad[:3])
+    s, b = get(f"/api/directions/{2**63 - 1}/cards")
+    check("int64 上界内不拦：2^63-1 维持下游 404（防钩子写成 >=）", s == 404, (s, b))
+    s, b = get("/api/directions/0/cards")
+    check("id=0 不被误伤（下游 404，钩子只管上溢）", s == 404, (s, b))
+
+    # -- #4 + #20 写入端日期 round-trip：3.11+ 的 fromisoformat 还吃 ISO 周日期
+    #    （2026-W01-1 → 2025-12-29）与基本格式（20260927），静默换日；空串/null
+    #    在 POST 侧被 or 短路成「今天」而 PATCH 侧 400，正相反（入口不对称）。
+    s, d_dt = call("POST", "/api/directions", {"name": QA_DIR, "description": "日期口径"})
+    dtid = d_dt["id"]
+    for desc, v in (("ISO 周日期", "2026-W01-1"), ("基本格式", "20260927"),
+                    ("非零填充", "2026-9-1"), ("空串", ""), ("null", None)):
+        s, _ = call("POST", f"/api/directions/{dtid}/logs", {"date": v, "minutes": 5})
+        check(f"新建日志 date={desc} → 400（与导入端同口径，原 201 静默记到别的日子）",
+              s == 400, (s, v))
+    s, log_dt = call("POST", f"/api/directions/{dtid}/logs", {"minutes": 5})
+    check("date 缺省仍记今天 → 201（收紧不动缺省语义）",
+          s == 201 and log_dt["date"] == date.today().isoformat(), (s, log_dt))
+    s, _ = call("POST", f"/api/directions/{dtid}/logs",
+                {"date": date.today().isoformat(), "minutes": 5})
+    check("规范今天日期 → 201（round-trip 不误伤正常值）", s == 201, s)
+    s, _ = call("PATCH", f"/api/logs/{log_dt['id']}", {"date": "2026-W01-1"})
+    check("编辑日志 date=ISO 周日期 → 400（与 POST 同口径）", s == 400, s)
+    s, _ = get(f"/api/directions/{dtid}/logs?from=2026-W01-1")
+    check("查询参数 from=ISO 周日期 → 400（parse_date 五个调用点一起收）", s == 400, s)
+    s, _ = get(f"/api/directions/{dtid}/review?date=20260927")
+    check("周报 date=基本格式 → 400", s == 400, s)
+
+    # -- #15 空 body 契约五资源统一：json_body 把畸形 body 归 {} 之后，
+    #    tasks/logs/cards 曾无声 no-op 返回 200，客户端以为改成功了。
+    _, ph_e = call("POST", f"/api/directions/{dtid}/phases", {"name": "阶段"})
+    _, tk_e = call("POST", f"/api/phases/{ph_e['id']}/tasks", {"title": "任务"})
+    _, cd_e = call("POST", f"/api/directions/{dtid}/cards", {"front": "卡"})
+    for desc, url in (("方向", f"/api/directions/{dtid}"), ("阶段", f"/api/phases/{ph_e['id']}"),
+                      ("任务", f"/api/tasks/{tk_e['id']}"), ("日志", f"/api/logs/{log_dt['id']}"),
+                      ("卡片", f"/api/cards/{cd_e['id']}")):
+        s, b = call("PATCH", url, {})
+        check(f"{desc} PATCH 空 body → 400（原 200 假成功）", s == 400, (s, b))
+
+    # -- #5 导入端 UTC 时间戳规范形态：非规范串入库后参与日界字典序比较，会把记录
+    #    整体挪出「今天」，今日已完成与每日新卡配额随之失守（Qoder 端到端实测
+    #    done_today 5→0）。保留 +00:00 后缀才能打到本轮新增的 round-trip 分支——
+    #    无后缀的形态早被旧的 endswith 检查挡住了。due 列改不动：fsrs 一致校验在前、
+    #    is_valid_fsrs 的 round-trip 在后，两层防护已把它钉死（Qoder 实测），故只
+    #    钉 reviewed_at 这个可达面。
+    for desc, fn in (("空格分隔", lambda x: x.replace("T", " ")),
+                     ("基本格式", lambda x: x.replace("-", ""))):
+        b = json.loads(json.dumps(backup))
+        rows = b["review_logs"] or [{"id": 987654, "card_id": b["cards"][0]["id"],
+                                     "rating": 3, "reviewed_at": "2026-09-20T10:00:00+00:00"}]
+        for r in rows:
+            r["reviewed_at"] = fn(r["reviewed_at"])
+        b["review_logs"] = rows
+        s, res = call("POST", "/api/import", b)
+        check(f"备份 reviewed_at 为{desc} → 400（原可入库并击穿今日口径）",
+              s == 400 and res and "复习时间" in res.get("error", ""), (s, res))
+    s, res = call("POST", "/api/import", backup)
+    check("规范形态备份原样回灌 → 200（round-trip 不误伤应用自产时间戳）",
+          s == 200, (s, str(res)[:60]))
+    _, dirs_ok4 = get("/api/directions")
+    check("产品轮对抗探针未破坏现库", len(dirs_ok4) == counts["directions"], len(dirs_ok4))
 else:
     print("SKIP  真实服务模式跳过（整库替换不应用于真实数据）")
 
