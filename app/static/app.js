@@ -697,11 +697,16 @@ const app = createApp({
             method: "POST",
             body: { date: todayStr(), minutes: focusMinutes, content: "🍅 番茄钟专注" },
           });
-          if (this.currentId === dirId) await this.loadRecentLogs();
+          // 统计刷新对齐其他写路径（检查轮 #19）：此前只刷 recentLogs，
+          // 详情页 chips 与总览卡片的累计时长/连续天数会一直停留在旧值
+          if (this.currentId === dirId) {
+            await Promise.all([this.loadRoadmap(), this.loadRecentLogs(), this.loadStats()]);
+          }
+          await this.loadDirections();
           this.toast(`🍅 专注 ${focusMinutes} 分钟完成，已记入学习日志，休息一下吧`);
         } catch (_) {
-          // 失败的具体原因 this.api 已 toast（如：目标方向已删除、时长非整数）
-          this.toast("🍅 专注完成，但日志记录失败");
+          // 失败的具体原因 this.api 已 toast（如：目标方向已删除）——不再补
+          // 通用文案覆盖它（单槽 toast 会把具体原因顶掉，检查轮 #18）
         }
         this.pomodoro.mode = "break";
         this.pomodoro.remaining = POMO_BREAK;

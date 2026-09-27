@@ -504,6 +504,10 @@ def update_task(task_id):
     if task is None:
         return not_found("任务不存在")
     body = json_body()
+    # 空 body 契约与 direction/phase 对齐（检查轮 #15）：json_body 把畸形 body
+    # 归 {} 后这里曾无声 no-op 返回 200，客户端会误以为修改成功
+    if not any(k in body for k in ("status", "title", "note")):
+        return bad_request("至少提供 status、title 或 note 中的一个字段")
     status = body.get("status")
     if status is not None:
         if status not in TASK_STATUSES:
@@ -700,6 +704,9 @@ def update_log(log_id):
     if log is None:
         return not_found("日志不存在")
     body = json_body()
+    # 空 body 契约对齐（检查轮 #15），语义同 update_task
+    if not any(k in body for k in ("date", "minutes", "content")):
+        return bad_request("至少提供 date、minutes 或 content 中的一个字段")
     new_date = log["date"]
     if "date" in body:
         try:
@@ -798,9 +805,13 @@ def create_card(direction_id):
         (card_to_json(card), due_of(card), cur.lastrowid),
     )
     db.commit()
-    return jsonify(_card_view(row_dict(db.execute(
-        "SELECT * FROM cards WHERE id = ?", (cur.lastrowid,)
-    ).fetchone()))), 201
+    row = row_dict(db.execute(
+        "SELECT * FROM cards WHERE id = ?", (cur.lastrowid,)).fetchone())
+    if row is None:
+        # 并发窗口：新卡刚插入即被另一连接删除——如实报 404，不让
+        # _card_view(None) 抛 TypeError 变 500（检查轮 #17）
+        return not_found("卡片刚被并发删除")
+    return jsonify(_card_view(row)), 201
 
 
 @app.patch("/api/cards/<int:card_id>")
@@ -811,6 +822,9 @@ def update_card(card_id):
     if card is None:
         return not_found("卡片不存在")
     body = json_body()
+    # 空 body 契约对齐（检查轮 #15），语义同 update_task
+    if not any(k in body for k in ("front", "back")):
+        return bad_request("至少提供 front 或 back 中的一个字段")
     if "front" in body:
         err, front = _text_field(body, "front", "卡片正面", required=True)
         if err:
@@ -828,9 +842,11 @@ def update_card(card_id):
         (front, back, card_id),
     )
     db.commit()
-    return jsonify(_card_view(row_dict(db.execute(
-        "SELECT * FROM cards WHERE id = ?", (card_id,)
-    ).fetchone())))
+    row = row_dict(db.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
+    if row is None:
+        # 提交后并发删除：更新随之被级联清掉，如实报 404 而非 500（检查轮 #17）
+        return not_found("卡片刚被并发删除")
+    return jsonify(_card_view(row))
 
 
 @app.delete("/api/cards/<int:card_id>")
@@ -911,7 +927,15 @@ def review_card(card_id):
     if not _is_int(rating) or rating not in (1, 2, 3, 4):
         return bad_request("rating 必须是 1~4 的整数（1 忘记 / 2 困难 / 3 良好 / 4 简单）")
     db = get_db()
-    db.execute("BEGIN IMMEDIATE")
+    # 写锁获取也在兜底内（检查轮 #14）：锁被持超过 busy_timeout（5s）时
+    # OperationalError 曾直接 500。只把 locked/busy 转成可重试的 400——
+    # no such table、磁盘满这类真故障原样 raise，保持 500 的响亮度
+    try:
+        db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e).lower() or "busy" in str(e).lower():
+            return bad_request("数据库忙，请稍后重试")
+        raise
     try:
         row = row_dict(db.execute(
             "SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
@@ -945,9 +969,13 @@ def review_card(card_id):
     except Exception:
         db.rollback()
         raise
-    return jsonify(_card_view(row_dict(db.execute(
-        "SELECT * FROM cards WHERE id = ?", (card_id,)
-    ).fetchone())))
+    row = row_dict(db.execute(
+        "SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone())
+    if row is None:
+        # commit 后并发删除：评分记录随卡片级联清掉、终态一致（检查轮 #17
+        # 复核证伪「重复评分」叙事），如实报 404 而非 TypeError 500
+        return not_found("卡片刚被并发删除")
+    return jsonify(_card_view(row))
 
 
 # ---------- 统计与回顾 ----------
