@@ -421,7 +421,14 @@ const app = createApp({
       }
     },
 
+    // 检查轮 #13：日期控件清空后值为 ""，addDays("") 产出 "NaN-NaN-NaN" 且
+    // 再翻周仍是同值（自维持）。翻周与查询前先归位今天，坏值不再产生
+    _normReviewDate() {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(this.reviewDate)) this.reviewDate = todayStr();
+    },
+
     async loadReview() {
+      this._normReviewDate();
       const seq = this._seq("review");
       try {
         const data = await this.api(
@@ -437,6 +444,7 @@ const app = createApp({
 
     shiftWeek(n) {
       this.viewError = "";
+      this._normReviewDate();
       this.reviewDate = addDays(this.reviewDate, n * 7);
       this.loadReview();
     },
