@@ -288,6 +288,37 @@ check("周报：非法日期 → 400", s == 400, s)
 s, _ = get(f"/api/directions/{did}/review?date=9999-12-31")
 check("周报：年末最后一周日期 → 400（周一+6 天溢出，原 500）", s == 400, s)
 
+# 删除端点承重断言（检查轮 #1）：此前 tasks / logs 两个 DELETE 在门禁里**零调用**，
+# 变异实测把 `DELETE FROM tasks WHERE id = ?` 去掉 WHERE（清空全表）后整套仍全绿。
+# 用 M2r 口径（清全表）而非 no-op——它直接命中「数据丢失」方向。
+s, del_t = call("POST", f"/api/phases/{ph1['id']}/tasks", {"title": "待删除任务"})
+del_tid = del_t["id"]
+s, del_l = call("POST", f"/api/directions/{did}/logs", {"minutes": 7, "content": "待删除日志"})
+del_lid = del_l["id"]
+_, rm_b = get(f"/api/directions/{did}/roadmap")
+tasks_b = [t for p in rm_b["phases"] for t in p["tasks"]]
+logs_b = get(f"/api/directions/{did}/logs")[1]
+s, _ = call("DELETE", f"/api/tasks/{del_tid}")
+check("删除任务 → 200", s == 200, s)
+_, rm_a = get(f"/api/directions/{did}/roadmap")
+tasks_a = [t for p in rm_a["phases"] for t in p["tasks"]]
+check("删除任务：只删这一行，同方向其余任务全部存活（去 WHERE 清全表的变异在此变红）",
+      len(tasks_a) == len(tasks_b) - 1 and not any(t["id"] == del_tid for t in tasks_a)
+      and any(t["id"] == t1["id"] for t in tasks_a) and any(t["id"] == t2["id"] for t in tasks_a),
+      (len(tasks_b), len(tasks_a)))
+s, _ = call("DELETE", f"/api/tasks/{del_tid}")
+check("重复删除任务 → 404", s == 404, s)
+s, _ = call("DELETE", "/api/tasks/999999")
+check("删除不存在的任务 → 404", s == 404, s)
+s, _ = call("DELETE", f"/api/logs/{del_lid}")
+check("删除日志 → 200", s == 200, s)
+logs_a = get(f"/api/directions/{did}/logs")[1]
+check("删除日志：只删这一行，其余日志存活（logs 侧同样原为零断言）",
+      len(logs_a) == len(logs_b) - 1 and not any(x["id"] == del_lid for x in logs_a)
+      and any(x["id"] == lg["id"] for x in logs_a), (len(logs_b), len(logs_a)))
+s, _ = call("DELETE", f"/api/logs/{del_lid}")
+check("重复删除日志 → 404", s == 404, s)
+
 # ---------- 3. 级联删除 ----------
 
 print("\n[3] 级联删除与幂等")
@@ -1011,6 +1042,45 @@ if _client is not None:
     s, _ = call("DELETE", f"/api/cards/{bad_card['id']}")
     check("删除坏卡 → 200（自救入口可用）", s == 200, s)
     call("DELETE", f"/api/directions/{d9eid}")
+
+    # 9.3c 复习日界承重断言（检查轮 #10）：把 _day_start_utc_iso 的「本地 0 点换算
+    # 成 UTC」改成「UTC 0 点」，此前任何时刻跑套件都全绿——而这条口径直接决定东八区
+    # 用户 0-8 点的「今日已完成」与新卡配额（同一比较逻辑）。判别式期望值由测试自己
+    # 按「本地日界」独立算出，不读被测函数，避免自证；两侧各钉一次（界内必须计入 /
+    # 界外必须不计入）。
+    from datetime import time as _dtime
+    _tz = datetime.now(timezone.utc).astimezone().tzinfo
+    _local0 = datetime.combine(date.today(), _dtime.min, tzinfo=_tz)      # 本地今日 0 点
+    _utc0 = datetime.combine(date.today(), _dtime.min, tzinfo=timezone.utc)  # 若误用 UTC 口径
+    if _local0.astimezone(timezone.utc) == _utc0:
+        print("SKIP  9.3c 日界判别式：本机时区偏移为 0，两界重合无差值可用")
+    else:
+        import sqlite3 as _sqlite3
+        import database as _dbmod
+
+        def _count_with_ts(ts_iso):
+            s, d_b = call("POST", "/api/directions", {"name": QA_DIR, "description": "日界"})
+            d_bid = d_b["id"]
+            _, c_b = call("POST", f"/api/directions/{d_bid}/cards", {"front": "日界卡"})
+            cb_id = c_b["id"]
+            call("POST", f"/api/cards/{cb_id}/review", {"rating": 3})
+            con = _sqlite3.connect(_dbmod.DB_PATH)
+            con.execute("UPDATE review_logs SET reviewed_at = ? WHERE card_id = ?",
+                        (ts_iso, cb_id))
+            con.commit()
+            con.close()
+            _, qb = get(f"/api/directions/{d_bid}/review/queue")
+            got = qb["counts"]["done_today"]
+            call("DELETE", f"/api/directions/{d_bid}")
+            return got
+
+        _l_utc = _local0.astimezone(timezone.utc)
+        _mid = (_l_utc + (_utc0 - _l_utc) / 2).isoformat()          # 两界之间：本地是今天、UTC 是昨天
+        check("日界：落在「本地今日 / UTC 昨日」之间的复习计入今日（UTC 口径变异会给 0）",
+              _count_with_ts(_mid) == 1, _mid)
+        _pre = (_l_utc - timedelta(hours=1)).isoformat()            # 本地昨日，两口径都应不计入
+        check("日界：本地昨日的复习不计入今日（钉住边界另一侧，防窗口被放宽）",
+              _count_with_ts(_pre) == 0, _pre)
 
     # 9.4 自包含迁移测试（§9.3）：内联 v2.0 四表 SCHEMA —— 建库 → 塞旧数据 →
     # 当前 init_db() → 断言新表出现且旧数据完整。不依赖 git 历史文件。
