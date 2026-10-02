@@ -99,6 +99,20 @@ def raw_get(path):
         return r.status, len(r.read())
 
 
+def text_get(path):
+    """纯文本端点（周报 Markdown 导出）：返回 (status, 文本, headers)。
+    两种模式的 headers 均按键名大小写不敏感地 .get() 取值。"""
+    if _client is not None:
+        resp = _client.get(path)
+        return resp.status_code, resp.get_data(as_text=True), resp.headers
+    try:
+        with urllib.request.urlopen(QA_URL + path, timeout=10) as r:
+            return r.status, r.read().decode("utf-8"), r.headers
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        return e.code, raw, e.headers
+
+
 # ---------- 断言工具 ----------
 
 def check(name, cond, extra=""):
@@ -287,6 +301,35 @@ s, _ = get(f"/api/directions/{did}/review?date=not-a-date")
 check("周报：非法日期 → 400", s == 400, s)
 s, _ = get(f"/api/directions/{did}/review?date=9999-12-31")
 check("周报：年末最后一周日期 → 400（周一+6 天溢出，原 500）", s == 400, s)
+
+# 周报 Markdown 导出：与 JSON 端点同一数据源（_review_payload）、同一错误契约。
+# 本周数据上下文：1 条 90 分钟日志「回归记录」+ 已完成任务 QA任务1（done_at=今天）
+s, md, md_hdrs = text_get(f"/api/directions/{did}/review.md?date={today.isoformat()}&download=1")
+check("周报 Markdown：200 且 Content-Type 为 markdown",
+      s == 200 and "markdown" in md_hdrs.get("Content-Type", ""), (s, md_hdrs.get("Content-Type")))
+check("周报 Markdown：download=1 → attachment 且文件名含周起始日",
+      "attachment" in md_hdrs.get("Content-Disposition", "")
+      and monday.isoformat() in md_hdrs.get("Content-Disposition", ""),
+      md_hdrs.get("Content-Disposition"))
+check("周报 Markdown：方向名/周区间/合计时长/日志内容/完成任务齐全",
+      md.startswith(f"# 周报 · {QA_DIR}")
+      and f"**{rv['week_start']} ~ {rv['week_end']}**" in md
+      and "1 小时 30 分" in md and "回归记录" in md and "QA任务1" in md,
+      md[:160])
+check("周报 Markdown：完整 7 天结构 + 本周小结 + 导出尾注",
+      md.count("\n### ") == 7 and "## 本周小结" in md
+      and "由 study tools 导出于" in md and md.rstrip().endswith("*"),
+      md.count("\n### "))
+s, md2, md2_hdrs = text_get(f"/api/directions/{did}/review.md")
+check("周报 Markdown：不带 download → 200 且无 attachment 头（对齐 /api/export 先例）",
+      s == 200 and "attachment" not in md2_hdrs.get("Content-Disposition", ""),
+      (s, md2_hdrs.get("Content-Disposition")))
+s, _, _ = text_get(f"/api/directions/{did}/review.md?date=not-a-date")
+check("周报 Markdown：非法日期 → 400（与 JSON 端点同契约）", s == 400, s)
+s, _, _ = text_get(f"/api/directions/{did}/review.md?date=9999-12-31")
+check("周报 Markdown：年末最后一周 → 400（与 JSON 端点同契约）", s == 400, s)
+s, _, _ = text_get("/api/directions/999999/review.md")
+check("周报 Markdown：方向不存在 → 404", s == 404, s)
 
 # 删除端点承重断言（检查轮 #1）：此前 tasks / logs 两个 DELETE 在门禁里**零调用**，
 # 变异实测把 `DELETE FROM tasks WHERE id = ?` 去掉 WHERE（清空全表）后整套仍全绿。

@@ -264,6 +264,9 @@
             <button class="btn btn-sm" @click="shiftWeek(-1)">← 上一周</button>
             <input type="date" v-model="reviewDate" @change="loadReview">
             <button class="btn btn-sm" @click="shiftWeek(1)">下一周 →</button>
+            <!-- 与「导出备份」同构的原生链接下载；date 为空串时后端归今天，与周报查询同口径 -->
+            <a class="btn btn-sm" title="下载当前所示周次的周报 Markdown 文件"
+               :href="`/api/directions/${currentId}/review.md?date=${reviewDate}&download=1`">⬇ 导出 Markdown</a>
           </div>
         </div>
         <div v-if="review">

@@ -7,8 +7,9 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 
-from flask import Flask, g, jsonify, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, request, Response, send_file, send_from_directory
 
 from database import close_db, get_db, init_db
 from demo_data import insert_demo
@@ -1050,21 +1051,31 @@ def get_stats(direction_id):
     })
 
 
-@app.get("/api/directions/<int:direction_id>/review")
-def get_review(direction_id):
-    if get_direction_or_none(direction_id) is None:
-        return not_found("方向不存在")
+def _review_week(direction_id):
+    """周报公共前置（JSON 端点与 Markdown 导出共用）：方向存在性、date 参数
+    解析、周区间计算。返回 (错误响应或 None, (方向, 周一, 周日) 或 None)——
+    两个端点的 404/400 契约由同一函数保证，不会各自漂移（docs/05 §3.6
+    共享状态的入口对称性）。"""
+    direction = get_direction_or_none(direction_id)
+    if direction is None:
+        return not_found("方向不存在"), None
     try:
         day = parse_date(request.args.get("date") or date.today().isoformat())
     except ValueError as e:
-        return bad_request(str(e))
+        return bad_request(str(e)), None
     try:
         # 年末最后一周的日期会把「周一+6 天」推出 9999-12-31 → OverflowError
         # （Qoder 审计：?date=9999-12-31 曾直接 500）
-        week_start, week_end = monday_of(day), monday_of(day) + timedelta(days=6)
+        week_start = monday_of(day)
+        return None, (direction, week_start, week_start + timedelta(days=6))
     except OverflowError:
-        return bad_request("日期太靠后，周区间无法计算")
+        return bad_request("日期太靠后，周区间无法计算"), None
+
+
+def _review_payload(direction, week_start, week_end):
+    """周报数据组装（JSON 端点与 Markdown 导出共用，口径单一事实源）。"""
     s, e = week_start.isoformat(), week_end.isoformat()
+    direction_id = direction["id"]
 
     logs = rows_dicts(get_db().execute(
         """SELECT * FROM logs WHERE direction_id = ? AND date BETWEEN ? AND ?
@@ -1089,13 +1100,119 @@ def get_review(direction_id):
             "logs": day_logs,
         })
 
-    return jsonify({
+    return {
         "week_start": s,
         "week_end": e,
         "total_minutes": sum(l["minutes"] for l in logs),
         "days": days,
         "done_tasks": done_tasks,
-    })
+    }
+
+
+@app.get("/api/directions/<int:direction_id>/review")
+def get_review(direction_id):
+    err, ctx = _review_week(direction_id)
+    if err:
+        return err
+    direction, week_start, week_end = ctx
+    return jsonify(_review_payload(direction, week_start, week_end))
+
+
+def _fmt_minutes_zh(m):
+    """分钟 → 中文时长，与前端 fmtMinutes 同口径（0 分钟 / X 分钟 / X 小时 Y 分）。"""
+    if not m or m <= 0:
+        return "0 分钟"
+    if m < 60:
+        return f"{m} 分钟"
+    h, minute = divmod(m, 60)
+    return f"{h} 小时 {minute} 分" if minute else f"{h} 小时"
+
+
+def _render_review_markdown(direction, review):
+    """周报 payload → Markdown 文本（纯函数，供导出与归档分享）。
+
+    学习日志内容原样嵌入、不做 Markdown 转义：本地单机工具、导出文件供
+    个人阅读，保真优先；空天保留「（无记录）」——归档场景里空白也是信息。
+    """
+    weekday_zh = "一二三四五六日"
+    lines = [
+        f"# 周报 · {direction['name']}",
+        "",
+        f"**{review['week_start']} ~ {review['week_end']}** · "
+        f"合计学习 **{_fmt_minutes_zh(review['total_minutes'])}**",
+        "",
+        "## 每日记录",
+        "",
+    ]
+    for d in review["days"]:
+        wd = weekday_zh[date.fromisoformat(d["date"]).weekday()]
+        head = f"### {d['date'][5:]} 周{wd}"
+        if d["minutes"]:
+            head += f" · {_fmt_minutes_zh(d['minutes'])}"
+        lines.append(head)
+        lines.append("")
+        if not d["logs"]:
+            lines.append("（无记录）")
+        for l in d["logs"]:
+            if l["content"]:
+                # 多行内容缩进为列表续行，避免破坏列表结构
+                lines.append("- " + l["content"].replace("\n", "\n  "))
+            else:
+                lines.append(f"- （{l['minutes']} 分钟）")
+        lines.append("")
+
+    lines.append(f"## 本周完成任务（{len(review['done_tasks'])}）")
+    lines.append("")
+    if review["done_tasks"]:
+        for t in review["done_tasks"]:
+            lines.append(f"- [x] {t['title']}（{t['phase_name']} · {t['done_at']}）")
+    else:
+        lines.append("（本周暂无完成任务）")
+    lines.append("")
+
+    # 本周小结：纯数据推导的汇总（活跃天数 / 峰值日 / 完成数），不引入主观措辞
+    active = [d for d in review["days"] if d["logs"]]
+    lines.append("## 本周小结")
+    lines.append("")
+    if not active:
+        lines.append("- 本周暂无学习记录")
+    else:
+        lines.append(f"- 7 天中 {len(active)} 天有学习记录，"
+                     f"累计 {_fmt_minutes_zh(review['total_minutes'])}")
+        if len(active) > 1:
+            peak = max(active, key=lambda d: d["minutes"])
+            lines.append(f"- 学习时长最长的一天：{peak['date'][5:]}（{_fmt_minutes_zh(peak['minutes'])}）")
+    lines.append(f"- 完成任务 {len(review['done_tasks'])} 个")
+    lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    lines.append(f"*由 study tools 导出于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    lines.append("")
+    return "\n".join(lines)
+
+
+@app.get("/api/directions/<int:direction_id>/review.md")
+def get_review_markdown(direction_id):
+    """周报导出为 Markdown（统计回顾页「导出 Markdown」按钮）。
+
+    数据与 JSON 端点同源（_review_payload）、错误契约一致；?download=1 时
+    以附件下载（对齐 /api/export 先例），文件名带方向名与周起始日——
+    filename 是 ASCII 回退，filename* 按 RFC 5987 编码中文。
+    """
+    err, ctx = _review_week(direction_id)
+    if err:
+        return err
+    direction, week_start, week_end = ctx
+    payload = _review_payload(direction, week_start, week_end)
+    resp = Response(_render_review_markdown(direction, payload),
+                    mimetype="text/markdown")
+    if request.args.get("download"):
+        pretty = f"{direction['name']}-周报-{payload['week_start']}.md"
+        resp.headers["Content-Disposition"] = (
+            f"attachment; filename=weekly-{payload['week_start']}.md; "
+            f"filename*=UTF-8''{quote(pretty)}")
+    return resp
 
 
 # ---------- 示例数据 ----------
