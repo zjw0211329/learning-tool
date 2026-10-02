@@ -361,12 +361,18 @@ if _client is not None:
             (did, _ghost_day))
         _conn.commit()
         s, _md_ghost, _ = text_get(f"/api/directions/{did}/review.md?date={today.isoformat()}")
-        _, _dirs_ghost = get("/api/directions")
-        _card_days = next(d["active_days"] for d in _dirs_ghost if d["id"] == did)
-        check("周报小结：幽灵日志日不计入「有记录天数」（与卡片 active_days 同口径）",
-              s == 200 and f"7 天中 {_card_days} 天有学习记录" in _md_ghost
-              and "- （0 分钟）" in _md_ghost,
-              ((_md_ghost.split("## 本周小结")[1][:60] if "## 本周小结" in _md_ghost else _md_ghost[:60]), _card_days))
+        _, _rv_ghost = get(f"/api/directions/{did}/review?date={today.isoformat()}")
+        # 期望判据取插入后的周报 JSON 自算「周内有时长或有内容的天」，与小结实现
+        # 独立成两份代码 —— 抓的是实现漂移而非数值巧合。刻意不用方向级 active_days：
+        # 那是全时段累计，与周内小结不同口径域，相等只是 fixture 全落本周的巧合，
+        # 将来给 did 加往周日志会因非缺陷原因变红（Qoder 复验观察，勿放宽回退）
+        _expect_active = sum(1 for d in _rv_ghost["days"]
+                             if d["minutes"] > 0 or any(l["content"] for l in d["logs"]))
+        check("周报小结：幽灵日志日不计入「有记录天数」（判据=周内自算，非方向级累计）",
+              s == 200 and f"7 天中 {_expect_active} 天有学习记录" in _md_ghost,
+              (_md_ghost.split("## 本周小结")[1][:60] if "## 本周小结" in _md_ghost else _md_ghost[:60], _expect_active))
+        check("周报小结：幽灵行仍如实列在每日区块（数据忠实，不靠藏行让数字好看）",
+              "- （0 分钟）" in _md_ghost, _md_ghost[:120])
     finally:
         _conn.execute("DELETE FROM logs WHERE id = ?", (_cur.lastrowid,))
         _conn.commit()
