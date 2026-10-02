@@ -331,6 +331,50 @@ check("周报 Markdown：年末最后一周 → 400（与 JSON 端点同契约�
 s, _, _ = text_get("/api/directions/999999/review.md")
 check("周报 Markdown：方向不存在 → 404", s == 404, s)
 
+# 镜像守护（Qoder 测试批）：页面时长文案由前端 JS 的 fmtMinutes 生成，导出文件由
+# 后端 Python 的 _fmt_minutes_zh 生成 —— 两份代码、语义镜像，无守护时改一侧措辞
+# 只会让导出文件与页面静默分叉。判别式期望值取自 app/static/app.js 里**真实的函数
+# 源码**（正则抽出交 node 执行），不手抄：手抄等于把另一份实现复制进测试，两侧同时
+# 错也测不出（docs/05 §3.7 附注精神）。
+if _client is not None:
+    import re as _re_m
+    _node = shutil.which("node")
+    if not _node:
+        print("SKIP  镜像守护：环境无 node，前后端时长格式化未做逐串比对"
+              "（改任一侧措辞时请手动核对两处）")
+    else:
+        _js = open(os.path.join(APP_DIR, "static", "app.js"), encoding="utf-8").read()
+        _fm = _re_m.search(r"^function fmtMinutes\(m\) \{.*?^\}", _js, _re_m.S | _re_m.M)
+        check("镜像守护前置：能从 app.js 抽出真实 fmtMinutes（函数改名/改写会在此变红）",
+              bool(_fm), None)
+        if _fm:
+            _vals = [0, -5, 1, 7, 59, 60, 61, 90, 120, 121, 599, 600, 601,
+                     3600, 99999, 1_000_000]
+            _jsf = os.path.join(_tmpdir, "_fmt_mirror.js")
+            with open(_jsf, "w", encoding="utf-8", newline="\n") as _f:
+                _f.write(_fm.group(0) + "\n"
+                         "const V = %s;\n"
+                         "const o = {};\n"
+                         "for (const v of V) o[String(v)] = fmtMinutes(v);\n"
+                         "console.log(JSON.stringify(o));\n" % json.dumps(_vals))
+            import subprocess
+            _rp = subprocess.run([_node, _jsf], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=30)
+            _jsout = {}
+            if _rp.returncode == 0:
+                _jsout = json.loads(_rp.stdout or "{}")
+            _pyout = {}
+            import main as _main_m
+            for v in _vals:
+                _pyout[str(v)] = _main_m._fmt_minutes_zh(v)
+            _mism = {k: (_jsout.get(k), _pyout[k]) for k in _pyout if _jsout.get(k) != _pyout[k]}
+            check(f"镜像守护：fmtMinutes(JS) 与 _fmt_minutes_zh(PY) 在 {len(_vals)} 个值上逐串一致"
+                  "（含 0/负数/59/60/61/整小时/上限）",
+                  bool(_jsout) and not _mism, (_mism, _rp.stderr[:80]))
+            os.remove(_jsf)
+else:
+    print("SKIP  镜像守护：真实服务模式不加载 app 模块，跳过前后端格式化比对")
+
 # 删除端点承重断言（检查轮 #1）：此前 tasks / logs 两个 DELETE 在门禁里**零调用**，
 # 变异实测把 `DELETE FROM tasks WHERE id = ?` 去掉 WHERE（清空全表）后整套仍全绿。
 # 用 M2r 口径（清全表）而非 no-op——它直接命中「数据丢失」方向。
