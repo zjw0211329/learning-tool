@@ -1170,8 +1170,13 @@ def _render_review_markdown(direction, review):
         lines.append("（本周暂无完成任务）")
     lines.append("")
 
-    # 本周小结：纯数据推导的汇总（活跃天数 / 峰值日 / 完成数），不引入主观措辞
-    active = [d for d in review["days"] if d["logs"]]
+    # 本周小结：纯数据推导的汇总（活跃天数 / 峰值日 / 完成数），不引入主观措辞。
+    # 「有记录的天」对齐 active_dates() 口径（minutes > 0 OR content != ''）——
+    # 手工备份能造出 0 分钟且无内容的幽灵日志行，按「有日志行」数天会让小结
+    # 比卡片 active_days 多 1（Qoder 审查轮实测 5 vs 6）；每日记录区块仍忠实
+    # 列出该行，只是不参与统计
+    active = [d for d in review["days"]
+              if d["minutes"] > 0 or any(l["content"] for l in d["logs"])]
     lines.append("## 本周小结")
     lines.append("")
     if not active:
@@ -1209,9 +1214,11 @@ def get_review_markdown(direction_id):
                     mimetype="text/markdown")
     if request.args.get("download"):
         pretty = f"{direction['name']}-周报-{payload['week_start']}.md"
+        # safe=""：quote() 默认放过斜杠，方向名带 / 时 filename* 里会出现原始 /，
+        # 部分客户端当作目录分隔符（Qoder 审查轮指认）——全量百分号编码
         resp.headers["Content-Disposition"] = (
             f"attachment; filename=weekly-{payload['week_start']}.md; "
-            f"filename*=UTF-8''{quote(pretty)}")
+            f"filename*=UTF-8''{quote(pretty, safe='')}")
     return resp
 
 

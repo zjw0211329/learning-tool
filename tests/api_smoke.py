@@ -18,6 +18,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.join(os.path.dirname(HERE), "app")
@@ -330,6 +331,48 @@ s, _, _ = text_get(f"/api/directions/{did}/review.md?date=9999-12-31")
 check("周报 Markdown：年末最后一周 → 400（与 JSON 端点同契约）", s == 400, s)
 s, _, _ = text_get("/api/directions/999999/review.md")
 check("周报 Markdown：方向不存在 → 404", s == 404, s)
+
+# 文件名斜杠转义（Qoder 审查轮指认）：quote() 默认 safe='/' 会放过方向名里的 /，
+# filename* 里的原始斜杠可能被下载方当目录分隔符。借道 PATCH 临时改 QA 方向名，
+# 结束后复原（写操作仍收敛在自建方向内，真实服务模式同样安全）
+try:
+    call("PATCH", f"/api/directions/{did}", {"name": QA_DIR + "/斜杠"})
+    s, _, _hdrs_slash = text_get(f"/api/directions/{did}/review.md?download=1")
+    _cd_slash = _hdrs_slash.get("Content-Disposition", "")
+    check("周报 Markdown：方向名带 / 时文件名全量编码（%2F，不被当目录分隔）",
+          s == 200 and QA_DIR + "/斜杠" not in _cd_slash
+          and quote(QA_DIR + "/斜杠", safe="") in _cd_slash,
+          _cd_slash)
+finally:
+    call("PATCH", f"/api/directions/{did}", {"name": QA_DIR})
+
+# 小结活跃口径（Qoder 审查轮指认）：手工备份能造出「0 分钟且无内容」的幽灵日志
+# （导入端按自救通道放行），小结此前按「有日志行」数天会比卡片 active_days 多 1
+# （实测 5 vs 6）。修复后对齐 active_dates 口径；每日记录区块仍忠实列出该行。
+# 真实服务模式不直连用户库，SKIP
+if _client is not None:
+    import sqlite3 as _sq
+    import database as _db_mod
+    _ghost_day = next(d["date"] for d in rv["days"] if not d["logs"])
+    _conn = _sq.connect(_db_mod.DB_PATH)
+    try:
+        _cur = _conn.execute(
+            "INSERT INTO logs(direction_id, date, minutes, content) VALUES (?, ?, 0, '')",
+            (did, _ghost_day))
+        _conn.commit()
+        s, _md_ghost, _ = text_get(f"/api/directions/{did}/review.md?date={today.isoformat()}")
+        _, _dirs_ghost = get("/api/directions")
+        _card_days = next(d["active_days"] for d in _dirs_ghost if d["id"] == did)
+        check("周报小结：幽灵日志日不计入「有记录天数」（与卡片 active_days 同口径）",
+              s == 200 and f"7 天中 {_card_days} 天有学习记录" in _md_ghost
+              and "- （0 分钟）" in _md_ghost,
+              ((_md_ghost.split("## 本周小结")[1][:60] if "## 本周小结" in _md_ghost else _md_ghost[:60]), _card_days))
+    finally:
+        _conn.execute("DELETE FROM logs WHERE id = ?", (_cur.lastrowid,))
+        _conn.commit()
+        _conn.close()
+else:
+    print("SKIP  幽灵日志小结口径：真实服务模式不直连库，跳过（该数据只有手工备份能造）")
 
 # 镜像守护（Qoder 测试批）：页面时长文案由前端 JS 的 fmtMinutes 生成，导出文件由
 # 后端 Python 的 _fmt_minutes_zh 生成 —— 两份代码、语义镜像，无守护时改一侧措辞
