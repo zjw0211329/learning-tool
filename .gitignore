@@ -10,3 +10,6 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# 会话产物（复盘/报告类，本地留档不入库）
+ZCode使用体验报告.md
